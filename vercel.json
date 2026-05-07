@@ -1,4 +1,9 @@
 {
+  "functions": {
+    "api/webhook/whatsapp.js": {
+      "maxDuration": 60
+    }
+  },
   "rewrites": [
     { "source": "/webhook/whatsapp", "destination": "/api/webhook/whatsapp" },
     { "source": "/health", "destination": "/api/health" }

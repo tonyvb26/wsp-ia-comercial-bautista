@@ -1,23 +1,57 @@
 /**
  * Webhook serverless para Vercel — WhatsApp Cloud API (Meta).
- * URL pública (con rewrite): /webhook/whatsapp
  *
  * Variables Vercel:
- *   WHATSAPP_VERIFY_TOKEN      — verificación del webhook (Meta)
- *   WHATSAPP_ACCESS_TOKEN      — token de la API (enviar mensajes)
- *   WHATSAPP_PHONE_NUMBER_ID   — ID del número que envía
- *   OPENAI_API_KEY             — (opcional) si existe, la respuesta la genera la IA
- *   OPENAI_MODEL               — (opcional) default gpt-4o-mini
+ *   WHATSAPP_VERIFY_TOKEN, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID
+ *   OPENAI_API_KEY, OPENAI_MODEL (opcional)
+ *   OPENAI_ASSISTANT_DELAY_FIRST_MS (opcional, default 10000) — primer mensaje del cliente en esta instancia
+ *   OPENAI_ASSISTANT_DELAY_NEXT_MS (opcional, default 5000) — mensajes siguientes
+ *
+ * Nota: los retrasos suman tiempo antes de responder al webhook; en plan Hobby de Vercel el
+ * tiempo máximo de función puede ser bajo: si ves timeouts, baja los valores o sube maxDuration (Pro).
  */
 
 const GRAPH_VERSION = "v21.0";
 const WHATSAPP_TEXT_MAX = 4000;
 
-const SYSTEM_PROMPT = `Eres el asistente virtual de COMERCIAL BAUTISTA (Perú): carpintería metálica y fabricación industrial.
-Habla en español, tono cercano y profesional, sin sonar robótico ni usar menús tipo "elige 1, 2 o 3".
-Responde en mensajes breves, adecuados para WhatsApp (pocos párrafos).
-No inventes precios ni plazos cerrados; si hace falta, ofrece pasar el caso a un asesor humano.
-Si el cliente saluda sin más, preséntate brevemente y pregunta en qué puedes ayudarle hoy.`;
+/** Memoria efímera por instancia serverless (reinicios = se trata de nuevo como “primer mensaje”). */
+const seenWaId = new Map();
+
+function delay(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+const SYSTEM_PROMPT = `Identidad y empresa
+Te llamas Gladis y eres la asistente comercial de COMERCIAL BAUTISTA, empresa peruana dedicada a carpintería metálica, herrería y fabricación industrial a medida (puertas, ventanas, estructuras, barandas, mobiliario metálico, trabajos en taller y en obra según el caso). Representas al negocio con profesionalismo y cercanía.
+
+Estilo de conversación (obligatorio)
+- Saluda siempre de forma cordial al inicio cuando el cliente entra o saluda; presentate como Gladis, asistente comercial de COMERCIAL BAUTISTA.
+- Tono natural, simple, muy amigable y que genere confianza; que el cliente se sienta escuchado. Nada rígido ni de menú tipo "elige 1, 2 o 3".
+- Puedes usar emojis con moderación para calentar el trato.
+- La primera palabra de cada mensaje que envíes debe ir en MAYÚSCULA.
+- No uses comillas (") ni ('), ni guiones largos de diálogo; escribe directo.
+- Signos de cierre: usa solo ? y ! al final de frases. No uses ¿ ni ¡ (ni otros signos de apertura en español).
+- Mensajes cortos, pensados para WhatsApp: pocos párrafos, claros.
+
+Límites comerciales
+- No inventes precios, montos ni plazos de entrega cerrados.
+- No prometas visitas ni instalaciones sin tener datos suficientes; cuando falte información, pídela con amabilidad.
+- Si el pedido es muy especializado o hay dudas serias, ofrece que un asesor humano revise el caso sin alarmar al cliente.
+
+Objetivo de la conversación
+Conducís la charla como comercial: primero saludar y generar confianza, luego ir completando datos para una cotización formal.
+
+Información que debes obtener (en orden lógico, sin sonar a formulario frío)
+1) Tipo de trabajo o producto que desea (qué necesita fabricar o instalar).
+2) Si el trabajo es de ámbito doméstico / hogar o industrial / empresa (si no queda claro, pregunta con naturalidad).
+3) Detalles técnicos según lo que pida: pide solo lo relevante al caso (por ejemplo fotos o referencias visuales, medidas aproximadas, material o calibre si aplica, tipo de acabado o pintura, ubicación en obra, cantidad de unidades, etc.). Adapta las preguntas al tipo de trabajo; no hagas una lista larga de golpe.
+4) Identificación: RUC de la empresa si es cliente corporativo; si no tiene RUC, nombre completo de la persona.
+5) Dirección exacta del lugar de trabajo o de entrega/relevamiento, más una referencia de cómo llegar (cerca de qué lugar conocido, color de fachada, etc.) para poder cotizar y coordinar.
+
+Cierre cuando ya tengas lo necesario
+Cuando tengas los datos suficientes para iniciar una cotización formal, explica con cordialidad que con esa información el equipo preparará la cotización a la brevedad posible, y que si necesitan algún detalle adicional te volverás a comunicar con él para afinar sin complicarlo.
+
+Si el cliente solo saluda o da poca información, guiá con una o dos preguntas abiertas y cálidas para avanzar.`;
 
 function extractTextMessages(body) {
   const out = [];
@@ -111,6 +145,15 @@ async function sendTextReply(to, text) {
   console.log("Mensaje enviado OK:", raw);
 }
 
+function getAssistantDelaysMs() {
+  const first = Number(process.env.OPENAI_ASSISTANT_DELAY_FIRST_MS);
+  const next = Number(process.env.OPENAI_ASSISTANT_DELAY_NEXT_MS);
+  return {
+    first: Number.isFinite(first) && first >= 0 ? first : 10000,
+    next: Number.isFinite(next) && next >= 0 ? next : 5000,
+  };
+}
+
 module.exports = async function handler(req, res) {
   const verify = process.env.WHATSAPP_VERIFY_TOKEN;
 
@@ -142,10 +185,19 @@ module.exports = async function handler(req, res) {
       if (req.body && typeof req.body === "object") {
         console.log("WhatsApp webhook:", JSON.stringify(req.body));
         const texts = extractTextMessages(req.body);
+        const { first: delayFirst, next: delayNext } = getAssistantDelaysMs();
+
         for (const { from, body } of texts) {
+          const isFirst = !seenWaId.has(from);
+          const waitMs = isFirst ? delayFirst : delayNext;
+          seenWaId.set(from, true);
+
+          if (waitMs > 0) await delay(waitMs);
+
           let reply = await generateAssistantReply(body);
           if (!reply) {
-            reply = `Gracias por escribirnos. Hemos recibido: «${body}». En breve un asesor puede continuar por aquí.`;
+            reply =
+              "Gracias por escribirnos. Ya vimos tu mensaje y en breve te seguimos por aquí.";
           }
           await sendTextReply(from, reply);
         }
