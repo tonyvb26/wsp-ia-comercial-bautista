@@ -295,6 +295,16 @@ function hasExplicitTechnicalDetail(blobLower) {
   );
 }
 
+/** Medidas aproximadas en texto del cliente (obligatorias además de la referencia visual analizada). */
+function hasApproximateMeasuresInBlob(blobLower) {
+  const b = blobLower || "";
+  return (
+    /\b\d+(?:[.,]\d+)?\s*(?:m|mt|mts|metro|metros|cm|cent[ií]metros?)\b/i.test(b) ||
+    /\b(alto|ancho|largo|altura|frente)\b.{0,22}\d/i.test(b) ||
+    /\d+(?:[.,]\d+)?\s*(?:m|mt|metros?)\b.{0,35}\b(alto|ancho|largo)/i.test(b)
+  );
+}
+
 function hasTechSatisfied(waId) {
   const blob = getFlattenedUserText(waId).toLowerCase();
   const pendingFields = getPendingFieldsForLatestUser(waId);
@@ -303,6 +313,7 @@ function hasTechSatisfied(waId) {
     pendingFields.includes("detalle técnico (medidas, material, acabado o referencia)") &&
     looksLikeDirectTechAnswer(lastUserText);
   const explicit = hasExplicitTechnicalDetail(blob) || directTech;
+  const measuresOk = hasApproximateMeasuresInBlob(blob);
   const imgs = getInboundMedia(waId).filter((m) => m.type === "image");
   if (!imgs.length) return explicit;
   const allDone = allInboundImagesAnalyzed(waId);
@@ -310,7 +321,8 @@ function hasTechSatisfied(waId) {
     // Si la visión falló o aún no corrió, permitir avanzar si el cliente ya dejó medidas/material en texto.
     return explicit;
   }
-  return explicit || imgs.length > 0;
+  // Referencia ya analizada: el acabado/modelo queda en la descripción de Gladis; igual necesitamos medidas del cliente en texto.
+  return measuresOk;
 }
 
 function getClientDataSignals(waId) {
@@ -433,10 +445,50 @@ function addNaturalNextStepIfUseful(waId, reply) {
   const nextQ = getPromptForMissingField(guide.next);
   if (!nextQ) return reply;
 
-  const alreadyAsksNext = getAskedFieldsFromReply(reply).includes(guide.next);
+  const asked = getAskedFieldsFromReply(reply);
+  const alreadyAsksNext = asked.includes(guide.next);
   if (alreadyAsksNext) return reply;
 
+  // Evita pegar dos veces la misma pregunta (ej. RUC) si el modelo ya la incluyó con otras palabras.
+  const nextSlug = nextQ.slice(0, 48).toLowerCase();
+  if (nextSlug && (reply || "").toLowerCase().includes(nextSlug)) return reply;
+
   return `${reply}\n\nPara continuar con tu cotización: ${nextQ}`;
+}
+
+/** Quita preguntas de ámbito si el cliente ya respondió hogar/empresa. */
+function stripRedundantScopeQuestion(waId, reply) {
+  const { hasScope } = getClientDataSignals(waId);
+  if (!hasScope || !reply) return reply;
+  let out = reply;
+  out = out.replace(/\s*Para avanzar,?\s+[^.?!]*\b(hogar|empresa|dom[eé]stic[oa]?|industrial)\b[^.?!]*\?/gi, "");
+  out = out.replace(/\s*[^.?!]*confirm(ar|ame)?\s+si\s+[^.?!]*\b(hogar|empresa)\b[^.?!]*\?/gi, "");
+  out = out.replace(/\s{2,}/g, " ").trim();
+  return out;
+}
+
+function getAssistantImageDescriptionExcerpts(waId) {
+  const history = getConversationHistory(waId);
+  const parts = [];
+  for (const m of history) {
+    if (m.role !== "assistant") continue;
+    const c = m.content || "";
+    if (!/coincide con lo que necesitas/i.test(c)) continue;
+    const core = c.replace(/\n+Si esta descripción coincide con lo que necesitas[\s\S]*$/i, "").trim();
+    if (core) parts.push(core);
+  }
+  return parts.join("\n---\n");
+}
+
+function getSpecsSummaryContext(waId) {
+  const userPart = getFlattenedUserText(waId);
+  const visionPart = getAssistantImageDescriptionExcerpts(waId);
+  if (!visionPart) return userPart;
+  return (
+    `${userPart}\n\n` +
+    `Descripción técnica que Gladis registró a partir de fotos del cliente (usala en tipo visual, material y acabado si el cliente no lo repitió en texto):\n` +
+    `${visionPart}`
+  );
 }
 
 function getLeadForwardTo(from) {
@@ -786,7 +838,8 @@ async function generateImageDescriptionReply(waId, mediaId, userText) {
 
   const visionPrompt =
     "Describe solo detalles visibles de la imagen para cotización (tipo de producto, material aparente, acabado/color, forma de paneles o vidrios si aplica, complejidad). " +
-    "No inventes medidas exactas ni datos no visibles. Si no se ven medidas, dilo y pedí medidas aproximadas en texto. " +
+    "No inventes medidas exactas ni datos no visibles. Si no se ven medidas, dilo y pedí solo medidas aproximadas en texto. " +
+    "Si en el contexto del cliente ya dijo si es para hogar o empresa, no vuelvas a preguntar eso; no repitas datos que ya figuren en el contexto. " +
     "Escribe breve, en un solo bloque, y pedí confirmación del cliente. " +
     `Si el cliente pide más referencias visuales, menciona la web ${COMPANY_WEB_URL} y Facebook ${COMPANY_FB_URL} en texto plano.`;
 
@@ -900,13 +953,14 @@ async function generateSpecsSummary(waId) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-  const convo = getFlattenedUserText(waId);
+  const convo = getSpecsSummaryContext(waId);
 
   const prompt = [
-    "Resume solo las especificaciones del trabajo brindadas por el cliente.",
+    "Resume las especificaciones del trabajo usando el texto del cliente y, si aparece, la descripción técnica que Gladis hizo a partir de fotos.",
+    "En material/acabado y referencia visual debés incluir lo descrito en las fotos aunque el cliente no lo haya repetido en sus mensajes, sin inventar nada que no esté en esas fuentes.",
     "Devuelve 4 a 7 líneas breves, sin inventar datos.",
     "Incluye: tipo de trabajo, medidas, material/acabado, cantidad, tipo hogar/industrial, nombre o RUC y ubicación/referencia.",
-    "Si un campo no existe, escribe exactamente Pendiente en ese campo. Nunca inventes valores.",
+    "Si un campo no existe en ninguna fuente, escribe exactamente Pendiente en ese campo.",
     "No saludes ni cierres.",
   ].join(" ");
 
@@ -1023,6 +1077,7 @@ async function processInbound(body) {
         visionReply =
           "Recibí tu imagen pero no pude analizarla en este momento. Por favor reenviala o describime medidas aproximadas, material y acabado en texto";
       }
+      visionReply = stripRedundantScopeQuestion(from, visionReply);
       visionReply = addNaturalNextStepIfUseful(from, visionReply);
       visionReply = enforceSingleIntroPolicy(from, visionReply, { allowIntro });
       visionReply = decorateReply(visionReply, { isFirst, shouldClose: false });
@@ -1086,6 +1141,7 @@ async function processInbound(body) {
     appendConversationTurn(from, "user", msgBody);
 
     if (bypassForcedFollowups) {
+      reply = stripRedundantScopeQuestion(from, reply);
       reply = addNaturalNextStepIfUseful(from, reply);
       reply = enforceSingleIntroPolicy(from, reply, { allowIntro });
       reply = decorateReply(reply, { isFirst, shouldClose: isClosingCue(msgBody) });
