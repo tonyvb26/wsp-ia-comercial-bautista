@@ -3,6 +3,8 @@
  * URL pública (con rewrite): /webhook/whatsapp
  *
  * Variable en Vercel: WHATSAPP_VERIFY_TOKEN (misma que "Token de verificación" en Meta)
+ *
+ * Nota: en /api/* Vercel usa res de Node (writeHead/end), no el res de Express.
  */
 module.exports = function handler(req, res) {
   const token = process.env.WHATSAPP_VERIFY_TOKEN;
@@ -14,21 +16,28 @@ module.exports = function handler(req, res) {
 
     if (!token) {
       console.error("Falta WHATSAPP_VERIFY_TOKEN en Vercel");
-      return res.status(500).send("Server misconfigured");
+      res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Server misconfigured");
+      return;
     }
 
     if (mode === "subscribe" && verifyToken === token) {
-      return res.status(200).send(challenge);
+      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end(String(challenge));
+      return;
     }
 
-    return res.status(403).send("Forbidden");
+    res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Forbidden");
+    return;
   }
 
   if (req.method === "POST") {
-    res.status(200).end();
+    res.writeHead(200);
+    res.end();
 
     try {
-      if (req.body && Object.keys(req.body).length > 0) {
+      if (req.body && typeof req.body === "object" && Object.keys(req.body).length > 0) {
         console.log("WhatsApp webhook:", JSON.stringify(req.body));
       }
     } catch {
@@ -37,6 +46,6 @@ module.exports = function handler(req, res) {
     return;
   }
 
-  res.setHeader("Allow", ["GET", "POST"]);
-  return res.status(405).end();
+  res.writeHead(405, { Allow: "GET, POST" });
+  res.end();
 };
