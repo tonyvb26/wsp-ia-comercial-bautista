@@ -27,6 +27,8 @@ const processedMessageIds = new Map();
 const confirmationStateByWaId = new Map();
 const imageStateByWaId = new Map();
 const mediaByWaId = new Map();
+/** IDs de imagen ya analizados con visión (máx. 2 imágenes por chat en flujo normal). */
+const visionAnalyzedMediaByWaId = new Map();
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -44,6 +46,8 @@ Estilo de conversación (obligatorio)
 - No uses comillas (") ni ('), ni guiones largos de diálogo; escribe directo.
 - Signos de cierre: usa solo ? y ! al final de frases. No uses ¿ ni ¡ (ni otros signos de apertura en español).
 - Mensajes cortos, pensados para WhatsApp: pocos párrafos, claros.
+- Haz máximo una pregunta concreta por mensaje. Si falta más de un dato, pide solo el siguiente dato lógico.
+- Antes de enviar una pregunta, revisa mentalmente si el cliente ya respondió ese dato con otras palabras, errores de tipeo o antes de que se lo pidieras.
 - No uses frases condescendientes o cumplidos al cliente (por ejemplo: excelente elección, suena bien, gran decisión).
 - Para validar avance usa solo aperturas neutras: Genial, Muy bien, Perfecto o Claro.
 - Nunca reinicies la conversación con saludo de inicio en mitad del flujo.
@@ -61,7 +65,7 @@ Conducís la charla como comercial: primero saludar y generar confianza, luego i
 Información que debes obtener (en orden lógico, sin sonar a formulario frío)
 1) Tipo de trabajo o producto que desea (qué necesita fabricar o instalar).
 2) Si el trabajo es de ámbito doméstico / hogar o industrial / empresa (si no queda claro, pregunta con naturalidad).
-3) Detalles técnicos según lo que pida: pide solo lo relevante al caso (por ejemplo fotos o referencias visuales, medidas aproximadas, material o calibre si aplica, tipo de acabado o pintura, ubicación en obra, cantidad de unidades, etc.). Adapta las preguntas al tipo de trabajo; no hagas una lista larga de golpe.
+3) Características del trabajo (prioridad): medidas aproximadas, material y acabado, y si envía foto o plano describí lo que se ve y pedí confirmación. Cantidad de unidades cuando corresponda. No avances a RUC, nombre ni dirección hasta tener claro producto, ámbito y detalle técnico o referencia visual analizada.
 4) Identificación: RUC de la empresa si es cliente corporativo; si no tiene RUC, nombre completo de la persona.
 5) Dirección exacta del lugar de trabajo o de entrega/relevamiento, más una referencia de cómo llegar (cerca de qué lugar conocido, color de fachada, etc.) para poder cotizar y coordinar.
 
@@ -179,7 +183,7 @@ function isRequestingServicesCatalogOrVisualRefs(text) {
 function companyInfoAndVisualRefsReply() {
   return (
     `Claro. Para ver trabajos y referencias visuales podés revisar nuestra web ${COMPANY_WEB_URL} y el perfil de Facebook ${COMPANY_FB_URL}. ` +
-    `Cuando quieras cotizar, contame producto, medidas, cantidad y si es para hogar o empresa`
+    `Ahí encontrarás referencias de nuestros trabajos para que puedas comparar modelos`
   );
 }
 
@@ -193,17 +197,153 @@ function isConfirmMessage(text) {
   return /\bCONFIRMO\b/.test(text || "");
 }
 
+function getLastUserText(waId) {
+  const history = getConversationHistory(waId);
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    if (history[i]?.role === "user") return history[i].content || "";
+  }
+  return "";
+}
+
+function getPreviousAssistantTextForLatestUser(waId) {
+  const history = getConversationHistory(waId);
+  const latestUserIndex = history.map((m) => m.role).lastIndexOf("user");
+  if (latestUserIndex <= 0) return "";
+  for (let i = latestUserIndex - 1; i >= 0; i -= 1) {
+    if (history[i]?.role === "assistant") return history[i].content || "";
+  }
+  return "";
+}
+
+function getPendingFieldsForLatestUser(waId) {
+  return getAskedFieldsFromReply(getPreviousAssistantTextForLatestUser(waId));
+}
+
+function isQuestionLike(text) {
+  return /[?]|^(por qu[eé]|cu[aá]nto|cu[aá]ndo|d[oó]nde|c[oó]mo|qu[eé]\b)/i.test((text || "").trim());
+}
+
+function looksLikeDirectNameOrIdAnswer(text) {
+  const clean = (text || "").trim();
+  if (!clean || isQuestionLike(clean)) return false;
+  if (/\b\d{8,11}\b/.test(clean)) return true;
+  if (!/^[a-záéíóúñü\s.]+$/i.test(clean)) return false;
+  const words = clean
+    .replace(/\./g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  if (words.length < 2 || words.length > 6) return false;
+  return !/\b(hogar|dom[eé]stico|empresa|industrial|pieza|unidad|puerta|mesa|modelo|medida|metro)\b/i.test(clean);
+}
+
+function looksLikeDirectAddressAnswer(text) {
+  const clean = (text || "").trim();
+  if (!clean || isQuestionLike(clean)) return false;
+  return (
+    /\b(avenida|av\.|jr\.|jir[oó]n|calle|pasaje|mz\.?|manzana|lote|sector|urbanizaci[oó]n|referencia|cerca de|frente a|costado|altura)\b/i.test(
+      clean
+    ) ||
+    (/\d/.test(clean) && clean.length >= 8)
+  );
+}
+
+function looksLikeDirectTechAnswer(text) {
+  const clean = (text || "").trim();
+  if (!clean || isQuestionLike(clean)) return false;
+  return (
+    /(imagen referencial|modelo|medida|metro|metros|madera|metal|met[aá]lic|acero|fierro|acabado|pintura|color|panel|marco|alto|ancho|largo|foto|plano)/i.test(
+      clean
+    ) ||
+    /\b\d+(?:[.,]\d+)?\s*(?:m|mt|mts|metro|metros|cm|cent[ií]metros?)\b/i.test(clean)
+  );
+}
+
+function looksLikeDirectScopeAnswer(text) {
+  const clean = (text || "").trim();
+  if (!clean || isQuestionLike(clean)) return false;
+  return /\b(hogar|casa|dom[eé]stic|empresa|industrial|colegio|escuela|instituci[oó]n|negocio|local|oficina|planta|f[aá]brica|obra|taller)\b/i.test(
+    clean
+  );
+}
+
+function markVisionAnalyzed(waId, mediaId) {
+  if (!waId || !mediaId) return;
+  let set = visionAnalyzedMediaByWaId.get(waId);
+  if (!set) {
+    set = new Set();
+    visionAnalyzedMediaByWaId.set(waId, set);
+  }
+  set.add(mediaId);
+}
+
+function allInboundImagesAnalyzed(waId) {
+  const imgs = getInboundMedia(waId).filter((m) => m.type === "image");
+  if (!imgs.length) return true;
+  const set = visionAnalyzedMediaByWaId.get(waId);
+  if (!set || !set.size) return false;
+  return imgs.every((m) => set.has(m.id));
+}
+
+/** Detalle técnico real en texto (no basta con decir modelo sin medidas ni material). */
+function hasExplicitTechnicalDetail(blobLower) {
+  const b = blobLower || "";
+  return (
+    /(metro|metros|medida|alto|altura|ancho|largo|profundidad|material|acabado|pintura|color|m2|m²|panel|paneles|marco|madera|melamina|calibre|espesor|foto|plano|vidrio|cristal|vidriado|bisagra|chapa|cerradura)/i.test(
+      b
+    ) ||
+    /\b\d+(?:[.,]\d+)?\s*(?:m|mt|mts|metro|metros|cm|cent[ií]metros?)\b/i.test(b)
+  );
+}
+
+function hasTechSatisfied(waId) {
+  const blob = getFlattenedUserText(waId).toLowerCase();
+  const pendingFields = getPendingFieldsForLatestUser(waId);
+  const lastUserText = getLastUserText(waId);
+  const directTech =
+    pendingFields.includes("detalle técnico (medidas, material, acabado o referencia)") &&
+    looksLikeDirectTechAnswer(lastUserText);
+  const explicit = hasExplicitTechnicalDetail(blob) || directTech;
+  const imgs = getInboundMedia(waId).filter((m) => m.type === "image");
+  if (!imgs.length) return explicit;
+  const allDone = allInboundImagesAnalyzed(waId);
+  if (!allDone) {
+    // Si la visión falló o aún no corrió, permitir avanzar si el cliente ya dejó medidas/material en texto.
+    return explicit;
+  }
+  return explicit || imgs.length > 0;
+}
+
 function getClientDataSignals(waId) {
   const blob = getFlattenedUserText(waId).toLowerCase();
-  const hasProduct = /(techo|reja|baranda|port[oó]n|puerta|ventana|estructura|mueble|afiche|gr[úu]a|trabajo|producto|cerco)/i.test(
-    blob
-  );
-  const hasTech = /(metro|medida|alto|ancho|material|acabado|pintura|imagen referencial|m2|m²)/i.test(blob);
+  const lastUserText = getLastUserText(waId);
+  const pendingFields = getPendingFieldsForLatestUser(waId);
+  const directlyAnsweredProduct =
+    pendingFields.includes("tipo de trabajo/producto") &&
+    !isQuestionLike(lastUserText) &&
+    /\b(quiero|necesito|cotizar|fabricar|instalar|hacer|elaborar|puert|purt|mesa|silla|reja|baranda|techo|cerco|mueble)\b/i.test(
+      lastUserText
+    );
+
+  const hasProduct =
+    /(techo|reja|baranda|port[oó]n|puert|purt|ventana|estructura|mueble|muebler[ií]a|mesa|silla|afiche|gr[úu]a|trabajo|producto|cerco|cercado|escalera|pasamanos|protector|mampara)/i.test(
+      blob
+    ) ||
+    /\b(fabricar|instalar|elaborar|hacer|cotizar|cotizaci[oó]n)\b.{0,45}\b(met[aá]lic|metal|madera|acero|fierro)\b/i.test(
+      blob
+    ) ||
+    directlyAnsweredProduct;
+  const hasTech = hasTechSatisfied(waId);
   const hasScope =
-    /(hogar|dom[eé]stic|industrial|empresa)/i.test(blob) ||
-    /\b(colegio|escuela|instituci[oó]n|negocio|local|oficina|planta|f[aá]brica|obra|taller)\b/i.test(blob);
-  const hasId = /(ruc|mi nombre es|me llamo|nombre completo|soy [a-záéíóúñ])/i.test(blob);
-  const hasAddress = /(direcci[oó]n|ubicaci[oó]n|avenida|av\.|jr\.|calle|sector|referencia|cerca de|lugar)/i.test(blob);
+    /(hogar|casa|dom[eé]stic|industrial|empresa|corporativo|institucional)/i.test(blob) ||
+    /\b(colegio|escuela|instituci[oó]n|negocio|local|oficina|planta|f[aá]brica|obra|taller)\b/i.test(blob) ||
+    (pendingFields.includes("ámbito (hogar/doméstico o empresa/industrial)") &&
+      looksLikeDirectScopeAnswer(lastUserText));
+  const hasId =
+    /(ruc|mi nombre es|me llamo|nombre completo|soy [a-záéíóúñ]|a nombre de|raz[oó]n social|dni)/i.test(blob) ||
+    (pendingFields.includes("identificación (RUC o nombre completo)") && looksLikeDirectNameOrIdAnswer(lastUserText));
+  const hasAddress =
+    /(direcci[oó]n|ubicaci[oó]n|avenida|av\.|jr\.|calle|sector|referencia|cerca de|lugar)/i.test(blob) ||
+    (pendingFields.includes("dirección y referencia") && looksLikeDirectAddressAnswer(lastUserText));
   return { blob, hasProduct, hasTech, hasScope, hasId, hasAddress };
 }
 
@@ -246,41 +386,57 @@ function getPromptForMissingField(field) {
   return null;
 }
 
-function getAskedFieldFromReply(reply) {
+function getAskedFieldsFromReply(reply) {
   const text = (reply || "").toLowerCase();
-  if (!text) return null;
+  if (!text) return [];
+  const fields = [];
   if (/(hogar|dom[eé]stic|empresa|industrial|[áa]mbito)/i.test(text)) {
-    return "ámbito (hogar/doméstico o empresa/industrial)";
+    fields.push("ámbito (hogar/doméstico o empresa/industrial)");
   }
   if (/(tipo de trabajo|producto necesitas|fabricar o instalar)/i.test(text)) {
-    return "tipo de trabajo/producto";
+    fields.push("tipo de trabajo/producto");
   }
   if (/(medidas|material|acabado|pintura|referencia visual|imagen referencial)/i.test(text)) {
-    return "detalle técnico (medidas, material, acabado o referencia)";
+    fields.push("detalle técnico (medidas, material, acabado o referencia)");
   }
   if (/(cu[aá]nt|cantidad|unidades|piezas|paños|tramos|[áa]reas)/i.test(text)) {
-    return "cantidad";
+    fields.push("cantidad");
   }
   if (/(ruc|nombre completo|identificaci[oó]n)/i.test(text)) {
-    return "identificación (RUC o nombre completo)";
+    fields.push("identificación (RUC o nombre completo)");
   }
   if (/(direcci[oó]n|ubicaci[oó]n|referencia|cerca de)/i.test(text)) {
-    return "dirección y referencia";
+    fields.push("dirección y referencia");
   }
-  return null;
+  return fields;
 }
 
 function enforceNoRepeatedQuestion(waId, reply) {
-  const askedField = getAskedFieldFromReply(reply);
-  if (!askedField) return reply;
+  const askedFields = getAskedFieldsFromReply(reply);
+  if (!askedFields.length) return reply;
 
   const missingGuide = getNextMissingDataPrompt(waId);
-  const askedAlreadyResolved = !missingGuide.missing.includes(askedField);
-  if (!askedAlreadyResolved) return reply;
+  if (missingGuide.next === "ninguno") return reply;
+
+  const asksOnlyNextField = askedFields.length === 1 && askedFields[0] === missingGuide.next;
+  if (asksOnlyNextField) return reply;
 
   const replacement = getPromptForMissingField(missingGuide.next);
   if (replacement) return replacement;
   return "Perfecto, continuemos con el siguiente detalle para tu cotización";
+}
+
+function addNaturalNextStepIfUseful(waId, reply) {
+  const guide = getNextMissingDataPrompt(waId);
+  if (guide.next === "ninguno") return reply;
+
+  const nextQ = getPromptForMissingField(guide.next);
+  if (!nextQ) return reply;
+
+  const alreadyAsksNext = getAskedFieldsFromReply(reply).includes(guide.next);
+  if (alreadyAsksNext) return reply;
+
+  return `${reply}\n\nPara continuar con tu cotización: ${nextQ}`;
 }
 
 function getLeadForwardTo(from) {
@@ -385,7 +541,10 @@ function getNextMissingDataPrompt(waId) {
 
 function hasLogicalQuantity(waId) {
   const { blob } = getClientDataSignals(waId);
+  const lastUserText = getLastUserText(waId);
+  const pendingFields = getPendingFieldsForLatestUser(waId);
   const isAreaWork = /(techo|techado|techar|cerco|cercado|cercar)/i.test(blob);
+  const numberWord = "(?:un|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|quince|veinte|treinta|cuarenta|cincuenta|cien|ciento|doscientos|trescientos)";
 
   // Detecta cantidades numéricas explícitas desde el inicio:
   // ej: "100 sillas", "50 mesas", "2 portones", "3 paños", "215 purtas" (typo), "x2", "2x".
@@ -397,21 +556,35 @@ function hasLogicalQuantity(waId) {
 
   // Número + producto cercano (errores de tipeo, orden libre): "215 purtas de 1.9 m", "cotizar 215 puertas".
   const hasNumericNearProduct =
-    /\b\d{1,5}\b\s*\D{0,30}\b(?:puert|purt|port[oó]|ventan|mesas?|sillas?|rejas?|barandas?|unidades?|piezas?|muebles?)\w*\b/i.test(
+    /\b\d{1,5}\b\s*\D{0,45}\b(?:puert|purt|port[oó]|ventan|mesas?|sillas?|rejas?|barandas?|unidades?|piezas?|muebles?|paneles?|hojas?|juegos?)\w*\b/i.test(
       blob
-    ) || /\bcotiz\w*\s+\d{1,5}\b/i.test(blob);
+    ) ||
+    /\bcotiz\w*\s+\d{1,5}\b/i.test(blob) ||
+    new RegExp(`\\b${numberWord}\\s+(?:puert|purt|port[oó]|ventan|mesas?|sillas?|rejas?|barandas?|unidades?|piezas?|muebles?)\\w*\\b`, "i").test(
+      blob
+    );
 
   const hasNumericUnitsOrNear = hasNumericUnits || hasNumericNearProduct;
+  const directQtyAnswer =
+    pendingFields.includes("cantidad") &&
+    !isQuestionLike(lastUserText) &&
+    (/\b\d{1,5}\b/.test(lastUserText) ||
+      new RegExp(`\\b${numberWord}\\b`, "i").test(lastUserText) ||
+      /\b(una?|dos|tres|pieza|piezas|unidad|unidades|paño|paños|hoja|hojas|juego|juegos)\b/i.test(lastUserText));
 
   if (isAreaWork) {
     return (
       /(área|area|m2|m²|metros cuadrados|sector|sectores|tramo|tramos|frente|perímetro|perimetro)/i.test(
         blob
-      ) || hasNumericUnitsOrNear
+      ) ||
+      hasNumericUnitsOrNear ||
+      directQtyAnswer
     );
   }
   return (
-    /(unidad|unidades|cantidad|pieza|piezas|paño|paños|hoja|hojas|juego|juegos)/i.test(blob) || hasNumericUnitsOrNear
+    /(unidad|unidades|cantidad|pieza|piezas|paño|paños|hoja|hojas|juego|juegos)/i.test(blob) ||
+    hasNumericUnitsOrNear ||
+    directQtyAnswer
   );
 }
 
@@ -612,8 +785,9 @@ async function generateImageDescriptionReply(waId, mediaId, userText) {
   if (!imageDataUrl) return null;
 
   const visionPrompt =
-    "Describe solo detalles visibles de la imagen para cotización (tipo de estructura, material aparente, acabado/color, medidas estimadas visuales si aplica, complejidad). " +
-    "No inventes medidas exactas ni datos no visibles. Escribe breve y pide confirmación del cliente. " +
+    "Describe solo detalles visibles de la imagen para cotización (tipo de producto, material aparente, acabado/color, forma de paneles o vidrios si aplica, complejidad). " +
+    "No inventes medidas exactas ni datos no visibles. Si no se ven medidas, dilo y pedí medidas aproximadas en texto. " +
+    "Escribe breve, en un solo bloque, y pedí confirmación del cliente. " +
     `Si el cliente pide más referencias visuales, menciona la web ${COMPANY_WEB_URL} y Facebook ${COMPANY_FB_URL} en texto plano.`;
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -664,6 +838,8 @@ async function generateAssistantReply(waId, userText, isFirst) {
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
   const history = getConversationHistory(waId);
   const missingGuide = getNextMissingDataPrompt(waId);
+  const imgCount = getInboundMedia(waId).filter((m) => m.type === "image").length;
+  const visionOk = imgCount === 0 || allInboundImagesAnalyzed(waId);
   const behaviorPrompt = isFirst
     ? "Si y solo si el cliente envía un saludo inicial breve (hola/buenas), respondé con un solo saludo natural (variá la fórmula), presentate una sola vez como Gladis de METALTEC - COMERCIAL BAUTISTA, sin repetir saludos ni aperturas en el mismo mensaje, y seguí con la cotización. Si el cliente ya viene con contexto o está respondiendo datos, NO te presentes."
     : "NO te vuelvas a presentar. Ya te presentaste antes. Continúa la conversación sin reiniciar.";
@@ -692,6 +868,7 @@ async function generateAssistantReply(waId, userText, isFirst) {
             "Estado de datos detectado en el historial del cliente. " +
             `Faltantes actuales: ${missingGuide.missing.length ? missingGuide.missing.join(", ") : "ninguno"}. ` +
             `Siguiente único dato a solicitar (si corresponde): ${missingGuide.next}. ` +
+            `Imágenes en el chat: ${imgCount}. Análisis visual completado para todas: ${visionOk ? "sí" : "pendiente"}. ` +
             "Regla estricta: si un dato NO está en faltantes, no lo vuelvas a preguntar.",
         },
         ...history,
@@ -838,15 +1015,20 @@ async function processInbound(body) {
         await sendTextReply(from, decorateReply(limitReply, { isFirst, shouldClose: false }));
         continue;
       }
-      // Primera mano: pedir detalles antes de analizar imagen.
-      const askDetail =
-        "Muy bien, ya recibí tu imagen referencial. Contame por favor qué necesitas exactamente: medidas aproximadas, material y acabado. Si deseas algo igual a la imagen, también indícamelo";
-      if (!msgBody || /imagen referencial enviada por el cliente/i.test(msgBody)) {
-        appendConversationTurn(from, "user", msgBody);
-        appendConversationTurn(from, "assistant", askDetail);
-        await sendTextReply(from, decorateReply(askDetail, { isFirst, shouldClose: false }));
-        continue;
+      appendConversationTurn(from, "user", msgBody);
+      let visionReply = mediaId ? await generateImageDescriptionReply(from, mediaId, msgBody) : null;
+      if (visionReply && mediaId) {
+        markVisionAnalyzed(from, mediaId);
+      } else {
+        visionReply =
+          "Recibí tu imagen pero no pude analizarla en este momento. Por favor reenviala o describime medidas aproximadas, material y acabado en texto";
       }
+      visionReply = addNaturalNextStepIfUseful(from, visionReply);
+      visionReply = enforceSingleIntroPolicy(from, visionReply, { allowIntro });
+      visionReply = decorateReply(visionReply, { isFirst, shouldClose: false });
+      appendConversationTurn(from, "assistant", visionReply);
+      await sendTextReply(from, visionReply);
+      continue;
     }
 
     const confirmState = confirmationStateByWaId.get(from);
@@ -872,15 +1054,28 @@ async function processInbound(body) {
     }
 
     let reply;
+    let bypassForcedFollowups = false;
     if (isHumanOrAiQuestion(msgBody)) {
       reply = "Soy asistente de METALTEC - COMERCIAL BAUTISTA";
+      bypassForcedFollowups = true;
     } else if (isRequestingServicesCatalogOrVisualRefs(msgBody)) {
       reply = companyInfoAndVisualRefsReply();
+      bypassForcedFollowups = true;
     } else if (isPrivacyRefusal(msgBody)) {
       reply =
         "Entiendo, no hay problema. Podemos avanzar con una cotización referencial sin tu dirección exacta por ahora. Para afinar el estimado, solo confirmame el tipo de trabajo, medidas aproximadas y acabado, y luego coordinamos ubicación cuando te sea cómodo";
+      bypassForcedFollowups = true;
     } else if (isImageStubbornRequest(msgBody) && imageState.lastMediaId && imageState.count <= 2) {
-      reply = await generateImageDescriptionReply(from, imageState.lastMediaId, msgBody);
+      const vSeen = visionAnalyzedMediaByWaId.get(from);
+      if (vSeen && vSeen.has(imageState.lastMediaId)) {
+        reply =
+          "Perfecto, seguimos con esa imagen como referencia. Si las medidas o el acabado no están claros, confirmamelo en texto para cerrar el detalle técnico";
+        bypassForcedFollowups = true;
+      } else {
+        reply = await generateImageDescriptionReply(from, imageState.lastMediaId, msgBody);
+        if (reply) markVisionAnalyzed(from, imageState.lastMediaId);
+        bypassForcedFollowups = true;
+      }
     } else {
       reply = await generateAssistantReply(from, msgBody, isFirst);
     }
@@ -889,6 +1084,15 @@ async function processInbound(body) {
     }
 
     appendConversationTurn(from, "user", msgBody);
+
+    if (bypassForcedFollowups) {
+      reply = addNaturalNextStepIfUseful(from, reply);
+      reply = enforceSingleIntroPolicy(from, reply, { allowIntro });
+      reply = decorateReply(reply, { isFirst, shouldClose: isClosingCue(msgBody) });
+      appendConversationTurn(from, "assistant", reply);
+      await sendTextReply(from, reply);
+      continue;
+    }
 
     if (isAlreadyProvidedPushback(msgBody)) {
       const guide = getNextMissingDataPrompt(from);
