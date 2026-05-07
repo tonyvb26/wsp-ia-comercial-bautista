@@ -6,9 +6,18 @@
  *   WHATSAPP_VERIFY_TOKEN      — verificación del webhook (Meta)
  *   WHATSAPP_ACCESS_TOKEN      — token de la API (enviar mensajes)
  *   WHATSAPP_PHONE_NUMBER_ID   — ID del número que envía
+ *   OPENAI_API_KEY             — (opcional) si existe, la respuesta la genera la IA
+ *   OPENAI_MODEL               — (opcional) default gpt-4o-mini
  */
 
 const GRAPH_VERSION = "v21.0";
+const WHATSAPP_TEXT_MAX = 4000;
+
+const SYSTEM_PROMPT = `Eres el asistente virtual de COMERCIAL BAUTISTA (Perú): carpintería metálica y fabricación industrial.
+Habla en español, tono cercano y profesional, sin sonar robótico ni usar menús tipo "elige 1, 2 o 3".
+Responde en mensajes breves, adecuados para WhatsApp (pocos párrafos).
+No inventes precios ni plazos cerrados; si hace falta, ofrece pasar el caso a un asesor humano.
+Si el cliente saluda sin más, preséntate brevemente y pregunta en qué puedes ayudarle hoy.`;
 
 function extractTextMessages(body) {
   const out = [];
@@ -25,6 +34,48 @@ function extractTextMessages(body) {
     }
   }
   return out;
+}
+
+async function generateAssistantReply(userText) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.65,
+      max_tokens: 700,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userText },
+      ],
+    }),
+  });
+
+  const raw = await r.text();
+  if (!r.ok) {
+    console.error("OpenAI error", r.status, raw);
+    return null;
+  }
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    console.error("OpenAI respuesta no JSON");
+    return null;
+  }
+
+  const text = data.choices?.[0]?.message?.content?.trim();
+  if (!text) return null;
+  return text.slice(0, WHATSAPP_TEXT_MAX);
 }
 
 async function sendTextReply(to, text) {
@@ -92,7 +143,10 @@ module.exports = async function handler(req, res) {
         console.log("WhatsApp webhook:", JSON.stringify(req.body));
         const texts = extractTextMessages(req.body);
         for (const { from, body } of texts) {
-          const reply = `Gracias por escribirnos. Hemos recibido: «${body}». (Respuesta automática de prueba — luego conectamos la IA.)`;
+          let reply = await generateAssistantReply(body);
+          if (!reply) {
+            reply = `Gracias por escribirnos. Hemos recibido: «${body}». En breve un asesor puede continuar por aquí.`;
+          }
           await sendTextReply(from, reply);
         }
       }
