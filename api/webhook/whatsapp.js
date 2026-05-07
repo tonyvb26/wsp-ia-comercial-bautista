@@ -19,8 +19,6 @@ const MAX_HISTORY_TURNS = 12;
 
 const COMPANY_WEB_URL = "https://comercialbautista.net/";
 const COMPANY_FB_URL = "https://www.facebook.com/profile.php?id=61588330106602";
-const GLADIS_INTRO_LINE =
-  "Hola, buenos días. Soy Gladis, asistente comercial de METALTEC - COMERCIAL BAUTISTA.";
 
 /** Memoria efímera por instancia serverless (reinicios = se trata de nuevo como “primer mensaje”). */
 const seenWaId = new Map();
@@ -38,7 +36,8 @@ const SYSTEM_PROMPT = `Identidad y empresa
 Te llamas Gladis y eres la asistente comercial de METALTEC - COMERCIAL BAUTISTA, empresa peruana dedicada a carpintería metálica, herrería y fabricación industrial a medida (puertas, ventanas, estructuras, barandas, mobiliario metálico, trabajos en taller y en obra según el caso). Representas al negocio con profesionalismo y cercanía.
 
 Estilo de conversación (obligatorio)
-- Saluda siempre de forma cordial al inicio cuando el cliente entra o saluda; presentate como Gladis, asistente comercial de METALTEC - COMERCIAL BAUTISTA.
+- Cuando el cliente entra con un saludo breve, respondé con un solo bloque de saludo cordial y natural. Variá la forma de saludar entre mensajes y conversaciones (por ejemplo Hola, Buenas, Buenos días, Buenas tardes o Buenas noches según el tono; no uses siempre la misma fórmula mecánica). En esa primera respuesta presentate una sola vez como Gladis, asistente comercial de METALTEC - COMERCIAL BAUTISTA, y pasá enseguida a avanzar la cotización.
+- En un mismo mensaje no repitas dos veces el saludo ni dos aperturas equivalentes (mal ejemplo: decir Hola, buenos días y luego otra vez Hola, buenos días, o duplicar frases como con gusto te ayudo). Leé tu propio texto antes de cerrar: si suena redundante, dejá una sola apertura y el resto directo al punto.
 - Tono natural, simple, muy amigable y que genere confianza; que el cliente se sienta escuchado. Nada rígido ni de menú tipo "elige 1, 2 o 3".
 - Usa emojis solo en 2 momentos: saludo inicial y cierre final de la conversación. En los demás mensajes no uses emojis.
 - La primera palabra de cada mensaje debe tener solo la primera letra en mayúscula (ejemplo: Hola, Genial, Perfecto), no toda la palabra en mayúsculas.
@@ -440,6 +439,24 @@ function decorateReply(reply, { isFirst, shouldClose }) {
   return clean;
 }
 
+function collapseRedundantGreetings(text) {
+  if (!text) return text;
+  let t = text.replace(/\s+/g, " ").trim();
+  t = t.replace(/\b(Hola,?\s+buenos d[ií]as\.?)\s+\1\s+/gi, "$1 ");
+  t = t.replace(/\b(Hola,?\s+buenas tardes\.?)\s+\1\s+/gi, "$1 ");
+  t = t.replace(/\b(Hola,?\s+buenas noches\.?)\s+\1\s+/gi, "$1 ");
+  t = t.replace(/\b(Buenas,?\s+buenos d[ií]as\.?)\s+\1\s+/gi, "$1 ");
+  t = t.replace(/\b(Buenas tardes\.?)\s+\1\s+/gi, "$1 ");
+  t = t.replace(/\b(Buenas noches\.?)\s+\1\s+/gi, "$1 ");
+  t = t.replace(/\b(Hola\.?)\s+(Hola\.?)\s+/gi, "$1 ");
+  t = t.replace(/\b(Buenas\.?)\s+(Buenas\.?)\s+/gi, "$1 ");
+  t = t.replace(
+    /^(.{0,55}(?:hola|buenas|buenos d[ií]as|buenas tardes|buenas noches)[^.?!]*[.?!])\s+\1\b/iu,
+    "$1 "
+  );
+  return t.trim();
+}
+
 function stripPresentation(text) {
   if (!text) return text;
   return text
@@ -458,17 +475,25 @@ function stripPresentation(text) {
 }
 
 function enforceSingleIntroPolicy(waId, reply, { allowIntro = false } = {}) {
-  const introLine = GLADIS_INTRO_LINE;
   const history = getConversationHistory(waId);
   const assistantTurns = history.filter((m) => m.role === "assistant").length;
 
   if (assistantTurns === 0 && allowIntro) {
-    const withoutPresentation = stripPresentation(reply);
-    if (!withoutPresentation) return introLine;
-    return `${introLine} ${withoutPresentation}`.trim();
+    let out = (reply || "").trim();
+    out = collapseRedundantGreetings(out);
+    if (!out) {
+      return "Buenas, soy Gladis de METALTEC - COMERCIAL BAUTISTA. Qué tipo de trabajo o producto necesitás fabricar o instalar?";
+    }
+    const hasGladis = /\bgladis\b/i.test(out);
+    const hasBrand = /\bmetaltec\b/i.test(out);
+    if (!hasGladis || !hasBrand) {
+      out = `Soy Gladis, asistente comercial de METALTEC - COMERCIAL BAUTISTA. ${out}`;
+      out = collapseRedundantGreetings(out);
+    }
+    return out;
   }
 
-  const sanitized = stripPresentation(reply);
+  const sanitized = collapseRedundantGreetings(stripPresentation(reply));
   return sanitized || "Muy bien, continuemos con tu solicitud";
 }
 
@@ -640,7 +665,7 @@ async function generateAssistantReply(waId, userText, isFirst) {
   const history = getConversationHistory(waId);
   const missingGuide = getNextMissingDataPrompt(waId);
   const behaviorPrompt = isFirst
-    ? "Si y solo si el cliente envía un saludo inicial breve (hola/buenas), preséntate como Gladis en esta respuesta. Si el cliente ya viene con contexto o está respondiendo datos, NO te presentes."
+    ? "Si y solo si el cliente envía un saludo inicial breve (hola/buenas), respondé con un solo saludo natural (variá la fórmula), presentate una sola vez como Gladis de METALTEC - COMERCIAL BAUTISTA, sin repetir saludos ni aperturas en el mismo mensaje, y seguí con la cotización. Si el cliente ya viene con contexto o está respondiendo datos, NO te presentes."
     : "NO te vuelvas a presentar. Ya te presentaste antes. Continúa la conversación sin reiniciar.";
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
