@@ -39,6 +39,8 @@ Estilo de conversación (obligatorio)
 - Mensajes cortos, pensados para WhatsApp: pocos párrafos, claros.
 - No uses frases condescendientes o cumplidos al cliente (por ejemplo: excelente elección, suena bien, gran decisión).
 - Para validar avance usa solo aperturas neutras: Genial, Muy bien, Perfecto o Claro.
+- Nunca reinicies la conversación con saludo de inicio en mitad del flujo.
+- Si el cliente se niega a compartir algún dato (por ejemplo dirección), responde con empatía y ofrece seguir con cotización referencial sin perder el contexto ya recolectado.
 
 Límites comerciales
 - No inventes precios, montos ni plazos de entrega cerrados.
@@ -103,6 +105,12 @@ function isClosingCue(text) {
   );
 }
 
+function isPrivacyRefusal(text) {
+  return /\b(privad[oa]|no (quiero|deseo|puedo)|primero (la )?cotizaci[oó]n|luego coordinamos|no compartir|no dar)\b/i.test(
+    text || ""
+  );
+}
+
 function decorateReply(reply, { isFirst, shouldClose }) {
   const clean = normalizeAssistantReply(reply);
   if (isFirst || shouldClose) return `${clean} 🙂`.slice(0, WHATSAPP_TEXT_MAX);
@@ -155,7 +163,7 @@ async function generateAssistantReply(waId, userText, isFirst) {
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
   const history = getConversationHistory(waId);
   const behaviorPrompt = isFirst
-    ? "Este es el primer mensaje del cliente en la conversación actual: presentate como Gladis solo en esta respuesta."
+    ? "Si y solo si el cliente envía un saludo inicial breve (hola/buenas), preséntate como Gladis en esta respuesta. Si el cliente ya viene con contexto o está respondiendo datos, NO te presentes."
     : "NO te vuelvas a presentar. Ya te presentaste antes. Continúa la conversación sin reiniciar.";
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -257,6 +265,9 @@ async function processInbound(body) {
     let reply;
     if (isHumanOrAiQuestion(msgBody)) {
       reply = "Soy asistente de COMERCIAL BAUTISTA";
+    } else if (isPrivacyRefusal(msgBody)) {
+      reply =
+        "Entiendo, no hay problema. Podemos avanzar con una cotización referencial sin tu dirección exacta por ahora. Para afinar el estimado, solo confirmame el tipo de trabajo, medidas aproximadas y acabado, y luego coordinamos ubicación cuando te sea cómodo";
     } else {
       reply = await generateAssistantReply(from, msgBody, isFirst);
     }
