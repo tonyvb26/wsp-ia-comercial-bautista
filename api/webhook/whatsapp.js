@@ -83,6 +83,14 @@ function getFlattenedConversationText(waId) {
   return history.map((m) => `${m.role}: ${m.content}`).join("\n");
 }
 
+function getFlattenedUserText(waId) {
+  const history = getConversationHistory(waId);
+  return history
+    .filter((m) => m.role === "user")
+    .map((m) => m.content)
+    .join("\n");
+}
+
 function normalizeAssistantReply(text) {
   if (!text) return text;
   let out = text.trim();
@@ -123,11 +131,15 @@ function isConfirmMessage(text) {
 }
 
 function hasEnoughInfoForSpecConfirmation(waId) {
-  const blob = getFlattenedConversationText(waId).toLowerCase();
-  const hasProduct = /(techo|reja|baranda|puerta|ventana|estructura|mueble|afiche|gr[úu]a|trabajo|producto)/i.test(blob);
+  const blob = getFlattenedUserText(waId).toLowerCase();
+  const hasProduct = /(techo|reja|baranda|port[oó]n|puerta|ventana|estructura|mueble|afiche|gr[úu]a|trabajo|producto)/i.test(
+    blob
+  );
   const hasTech = /(metro|medida|alto|ancho|material|acabado|pintura|unidad|cantidad|imagen referencial)/i.test(blob);
+  const hasScope = /(hogar|dom[eé]stic|industrial|empresa)/i.test(blob);
   const hasId = /(ruc|mi nombre es|nombre completo|soy [a-záéíóúñ])/i.test(blob);
-  return hasProduct && hasTech && hasId;
+  const hasAddress = /(direcci[oó]n|ubicaci[oó]n|avenida|av\.|jr\.|calle|sector|referencia|cerca de|lugar)/i.test(blob);
+  return hasProduct && hasTech && hasScope && hasId && hasAddress;
 }
 
 function decorateReply(reply, { isFirst, shouldClose }) {
@@ -232,13 +244,13 @@ async function generateSpecsSummary(waId) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-  const convo = getFlattenedConversationText(waId);
+  const convo = getFlattenedUserText(waId);
 
   const prompt = [
     "Resume solo las especificaciones del trabajo brindadas por el cliente.",
     "Devuelve 4 a 7 líneas breves, sin inventar datos.",
-    "Incluye: tipo de trabajo, medidas, material/acabado, cantidad, tipo hogar/industrial, nombre o RUC y ubicación/referencia si existe.",
-    "Si un campo no existe, no lo inventes.",
+    "Incluye: tipo de trabajo, medidas, material/acabado, cantidad, tipo hogar/industrial, nombre o RUC y ubicación/referencia.",
+    "Si un campo no existe, escribe exactamente Pendiente en ese campo. Nunca inventes valores.",
     "No saludes ni cierres.",
   ].join(" ");
 
