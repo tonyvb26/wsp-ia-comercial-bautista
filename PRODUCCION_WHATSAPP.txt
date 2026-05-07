@@ -1,0 +1,45 @@
+CHECKLIST — Pasar de PRUEBA a CLIENTES REALES (WhatsApp Cloud API + Meta)
+
+A) Negocio y facturación en Meta
+   1. business.facebook.com → tu portafolio (ej. Metaltec - Comercial Bautista).
+   2. Verificación del negocio: completa lo que Meta pida (documentos, datos). Sin verificación
+      a veces no puedes usar todo en producción.
+   3. WhatsApp → Cuentas / configuración de facturación: agrega método de pago si Meta lo exige
+      (las conversaciones pueden generar cargo según categoría y región).
+
+B) Número de WhatsApp Business REAL (no el +1 555 de prueba)
+   1. developers.facebook.com → tu app → WhatsApp → Configuración (o API setup).
+   2. "Agregar número de teléfono" / gestionar números: vincula un número que sea SOLO para
+      WhatsApp Business API (no puede estar activo en la app normal de WhatsApp a la vez).
+   3. Completa nombre para mostrar, perfil y lo que Meta solicite hasta que el número quede
+      operativo en producción.
+
+C) App en modo producción
+   1. developers.facebook.com → tu app → revisa "Modo desarrollo" vs publicación.
+   2. Completa requisitos de "Publicar" (política de privacidad URL, etc.) si Meta los marca.
+   3. Si algo pide "Revisión de la app", envía lo necesario (depende de permisos y caso de uso).
+
+D) Tokens y IDs en Vercel (reemplazar los de PRUEBA)
+   1. WHATSAPP_PHONE_NUMBER_ID → el del número REAL (nuevo en el panel).
+   2. WHATSAPP_ACCESS_TOKEN → token PERMANENTE recomendado:
+      - Meta Business Suite / Usuarios del sistema → usuario sistema con rol adecuado
+      - Genera token con permisos whatsapp_business_messaging, whatsapp_business_management
+      - Guárdalo solo en Vercel (nunca en Git).
+   3. WHATSAPP_VERIFY_TOKEN → puede seguir igual si no lo cambiaste.
+   4. Tras cambiar variables: Redeploy en Vercel.
+
+E) Webhook en Meta
+   1. La URL sigue siendo: https://TU-DOMINIO/webhook/whatsapp (Vercel o subdominio propio).
+   2. "Verificar y guardar" de nuevo si cambias dominio o token de verificación.
+   3. Campo "messages" suscrito (como ya hiciste en prueba).
+
+F) Plantillas (templates)
+   - Para escribir PRIMERO al cliente (fuera de la ventana de 24 h) necesitas plantillas aprobadas.
+   - Si solo RESPONDES cuando el cliente escribe, con mensajes de sesión suele bastar la API normal.
+
+G) Dominio propio (opcional pero recomendable)
+   - webhook.tudominio.net → CNAME a Vercel → actualizar URL del webhook en Meta.
+
+Notas
+   - El código en api/webhook/whatsapp.js no distingue prueba vs producción: solo usan otros ID/token.
+   - Si algo falla, revisa Logs en Vercel y "Acciones requeridas" en developers.facebook.com.
