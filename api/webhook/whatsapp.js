@@ -152,10 +152,23 @@ function getClientDataSignals(waId) {
 function hasLogicalQuantity(waId) {
   const { blob } = getClientDataSignals(waId);
   const isAreaWork = /(techo|techado|techar|cerco|cercado|cercar)/i.test(blob);
+
+  // Detecta cantidades numéricas explícitas desde el inicio:
+  // ej: "100 sillas", "50 mesas", "2 portones", "3 paños", "x2", "2x".
+  const hasNumericUnits =
+    /\b\d+\s*(unidad(?:es)?|pieza(?:s)?|paño(?:s)?|hoja(?:s)?|juego(?:s)?|silla(?:s)?|mesa(?:s)?|port[oó]n(?:es)?|puerta(?:s)?|ventana(?:s)?|reja(?:s)?|baranda(?:s)?|mueble(?:s)?|afiche(?:s)?)\b/i.test(
+      blob
+    ) ||
+    /\b(x\s*\d+|\d+\s*x)\b/i.test(blob);
+
   if (isAreaWork) {
-    return /(área|area|m2|m²|metros cuadrados|sector|sectores|tramo|tramos|frente|perímetro|perimetro)/i.test(blob);
+    return (
+      /(área|area|m2|m²|metros cuadrados|sector|sectores|tramo|tramos|frente|perímetro|perimetro)/i.test(
+        blob
+      ) || hasNumericUnits
+    );
   }
-  return /(unidad|unidades|cantidad|pieza|piezas|paño|paños|hoja|hojas|juego|juegos)/i.test(blob);
+  return /(unidad|unidades|cantidad|pieza|piezas|paño|paños|hoja|hojas|juego|juegos)/i.test(blob) || hasNumericUnits;
 }
 
 function getLogicalQuantityQuestion(waId) {
