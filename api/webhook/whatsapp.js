@@ -20,6 +20,7 @@ const MAX_HISTORY_TURNS = 12;
 /** Memoria efímera por instancia serverless (reinicios = se trata de nuevo como “primer mensaje”). */
 const seenWaId = new Map();
 const conversationByWaId = new Map();
+const processedMessageIds = new Map();
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -31,11 +32,13 @@ Te llamas Gladis y eres la asistente comercial de COMERCIAL BAUTISTA, empresa pe
 Estilo de conversación (obligatorio)
 - Saluda siempre de forma cordial al inicio cuando el cliente entra o saluda; presentate como Gladis, asistente comercial de COMERCIAL BAUTISTA.
 - Tono natural, simple, muy amigable y que genere confianza; que el cliente se sienta escuchado. Nada rígido ni de menú tipo "elige 1, 2 o 3".
-- Puedes usar emojis con moderación para calentar el trato.
-- La primera palabra de cada mensaje que envíes debe ir en MAYÚSCULA.
+- Usa emojis solo en 2 momentos: saludo inicial y cierre final de la conversación. En los demás mensajes no uses emojis.
+- La primera palabra de cada mensaje debe tener solo la primera letra en mayúscula (ejemplo: Hola, Genial, Perfecto), no toda la palabra en mayúsculas.
 - No uses comillas (") ni ('), ni guiones largos de diálogo; escribe directo.
 - Signos de cierre: usa solo ? y ! al final de frases. No uses ¿ ni ¡ (ni otros signos de apertura en español).
 - Mensajes cortos, pensados para WhatsApp: pocos párrafos, claros.
+- No uses frases condescendientes o cumplidos al cliente (por ejemplo: excelente elección, suena bien, gran decisión).
+- Para validar avance usa solo aperturas neutras: Genial, Muy bien, Perfecto o Claro.
 
 Límites comerciales
 - No inventes precios, montos ni plazos de entrega cerrados.
@@ -77,10 +80,47 @@ function normalizeAssistantReply(text) {
   out = out.replace(/[¿¡]/g, "");
   out = out.replace(/["']/g, "");
   out = out.replace(/\s+\n/g, "\n");
+  out = out.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "");
+  out = out.replace(/\s{2,}/g, " ").trim();
 
-  // Fuerza primera palabra en mayúscula.
-  out = out.replace(/^\s*([a-záéíóúñ])/i, (m, c) => m.replace(c, c.toUpperCase()));
+  // Fuerza primera palabra con formato "SoloInicialMayuscula" (no TODO EN MAYUSCULAS).
+  out = out.replace(
+    /^\s*([A-Za-zÁÉÍÓÚÑáéíóúñ]+)\b/u,
+    (word) => word.charAt(0).toLocaleUpperCase("es-PE") + word.slice(1).toLocaleLowerCase("es-PE")
+  );
   return out.slice(0, WHATSAPP_TEXT_MAX);
+}
+
+function isHumanOrAiQuestion(text) {
+  return /\b(eres|sos)\b.{0,20}\b(ia|ai|humano|robot|bot)\b|\b(ia|ai|humano|robot|bot)\b.{0,20}\b(eres|sos)\b/i.test(
+    text || ""
+  );
+}
+
+function isClosingCue(text) {
+  return /\b(gracias|ok|oki|listo|perfecto|está bien|esta bien|de acuerdo|chau|adiós|adios)\b/i.test(
+    text || ""
+  );
+}
+
+function decorateReply(reply, { isFirst, shouldClose }) {
+  const clean = normalizeAssistantReply(reply);
+  if (isFirst || shouldClose) return `${clean} 🙂`.slice(0, WHATSAPP_TEXT_MAX);
+  return clean;
+}
+
+function markProcessedMessage(id) {
+  if (!id) return false;
+  const now = Date.now();
+  const prev = processedMessageIds.get(id);
+  if (prev && now - prev < 1000 * 60 * 20) return true;
+  processedMessageIds.set(id, now);
+  if (processedMessageIds.size > 5000) {
+    for (const [k, t] of processedMessageIds) {
+      if (now - t > 1000 * 60 * 60) processedMessageIds.delete(k);
+    }
+  }
+  return false;
 }
 
 function extractTextMessages(body) {
@@ -202,17 +242,25 @@ async function processInbound(body) {
   const texts = extractTextMessages(body);
   const { first: delayFirst, next: delayNext } = getAssistantDelaysMs();
 
-  for (const { from, body: msgBody } of texts) {
+  for (const { from, body: msgBody, id } of texts) {
+    if (markProcessedMessage(id)) continue;
+
     const isFirst = !seenWaId.has(from);
     const waitMs = isFirst ? delayFirst : delayNext;
     seenWaId.set(from, true);
 
     if (waitMs > 0) await delay(waitMs);
 
-    let reply = await generateAssistantReply(from, msgBody, isFirst);
+    let reply;
+    if (isHumanOrAiQuestion(msgBody)) {
+      reply = "Soy asistente de COMERCIAL BAUTISTA";
+    } else {
+      reply = await generateAssistantReply(from, msgBody, isFirst);
+    }
     if (!reply) {
       reply = "Gracias por escribirnos. Ya vimos tu mensaje y en breve te seguimos por aquí.";
     }
+    reply = decorateReply(reply, { isFirst, shouldClose: isClosingCue(msgBody) });
     appendConversationTurn(from, "user", msgBody);
     appendConversationTurn(from, "assistant", reply);
     await sendTextReply(from, reply);
