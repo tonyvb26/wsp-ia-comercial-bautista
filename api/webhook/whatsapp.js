@@ -17,22 +17,28 @@ const GRAPH_VERSION = "v21.0";
 const WHATSAPP_TEXT_MAX = 4000;
 const MAX_HISTORY_TURNS = 12;
 
+const COMPANY_WEB_URL = "https://comercialbautista.net/";
+const COMPANY_FB_URL = "https://www.facebook.com/profile.php?id=61588330106602";
+const GLADIS_INTRO_LINE =
+  "Hola, buenos días. Soy Gladis, asistente comercial de METALTEC - COMERCIAL BAUTISTA.";
+
 /** Memoria efímera por instancia serverless (reinicios = se trata de nuevo como “primer mensaje”). */
 const seenWaId = new Map();
 const conversationByWaId = new Map();
 const processedMessageIds = new Map();
 const confirmationStateByWaId = new Map();
 const imageStateByWaId = new Map();
+const mediaByWaId = new Map();
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 const SYSTEM_PROMPT = `Identidad y empresa
-Te llamas Gladis y eres la asistente comercial de COMERCIAL BAUTISTA, empresa peruana dedicada a carpintería metálica, herrería y fabricación industrial a medida (puertas, ventanas, estructuras, barandas, mobiliario metálico, trabajos en taller y en obra según el caso). Representas al negocio con profesionalismo y cercanía.
+Te llamas Gladis y eres la asistente comercial de METALTEC - COMERCIAL BAUTISTA, empresa peruana dedicada a carpintería metálica, herrería y fabricación industrial a medida (puertas, ventanas, estructuras, barandas, mobiliario metálico, trabajos en taller y en obra según el caso). Representas al negocio con profesionalismo y cercanía.
 
 Estilo de conversación (obligatorio)
-- Saluda siempre de forma cordial al inicio cuando el cliente entra o saluda; presentate como Gladis, asistente comercial de COMERCIAL BAUTISTA.
+- Saluda siempre de forma cordial al inicio cuando el cliente entra o saluda; presentate como Gladis, asistente comercial de METALTEC - COMERCIAL BAUTISTA.
 - Tono natural, simple, muy amigable y que genere confianza; que el cliente se sienta escuchado. Nada rígido ni de menú tipo "elige 1, 2 o 3".
 - Usa emojis solo en 2 momentos: saludo inicial y cierre final de la conversación. En los demás mensajes no uses emojis.
 - La primera palabra de cada mensaje debe tener solo la primera letra en mayúscula (ejemplo: Hola, Genial, Perfecto), no toda la palabra en mayúsculas.
@@ -43,6 +49,7 @@ Estilo de conversación (obligatorio)
 - Para validar avance usa solo aperturas neutras: Genial, Muy bien, Perfecto o Claro.
 - Nunca reinicies la conversación con saludo de inicio en mitad del flujo.
 - Si el cliente se niega a compartir algún dato (por ejemplo dirección), responde con empatía y ofrece seguir con cotización referencial sin perder el contexto ya recolectado.
+- Si el cliente pide información general sobre trabajos que realizamos, catálogo, modelos, diseños, fotos o referencias visuales, comparte siempre estos enlaces en texto plano: ${COMPANY_WEB_URL} y ${COMPANY_FB_URL}. No digas que no puedes compartir imágenes sin ofrecer antes esos enlaces.
 
 Límites comerciales
 - No inventes precios, montos ni plazos de entrega cerrados.
@@ -63,7 +70,8 @@ Cierre cuando ya tengas lo necesario
 Cuando tengas los datos suficientes para iniciar una cotización formal, explica con cordialidad que con esa información el equipo preparará la cotización a la brevedad posible, y que si necesitan algún detalle adicional te volverás a comunicar con él para afinar sin complicarlo.
 Antes de cerrar, muestra un resumen claro de especificaciones del trabajo y pide al cliente que confirme escribiendo exactamente CONFIRMO en mayúsculas.
 
-Si el cliente solo saluda o da poca información, guiá con una o dos preguntas abiertas y cálidas para avanzar.`;
+Si el cliente solo saluda o da poca información, guiá con una o dos preguntas abiertas y cálidas para avanzar.
+Regla anti-repetición: si el cliente ya dio un dato en cualquier mensaje anterior (aunque sea antes de que lo pidieras), no vuelvas a preguntarlo; seguí con el siguiente dato faltante.`;
 
 function getConversationHistory(waId) {
   const history = conversationByWaId.get(waId);
@@ -90,6 +98,23 @@ function getFlattenedUserText(waId) {
     .filter((m) => m.role === "user")
     .map((m) => m.content)
     .join("\n");
+}
+
+function getInboundMedia(waId) {
+  const list = mediaByWaId.get(waId);
+  return Array.isArray(list) ? list : [];
+}
+
+function appendInboundMedia(waId, media) {
+  if (!media?.id || !media?.type) return;
+  const list = getInboundMedia(waId);
+  const duplicated = list.some((m) => m.id === media.id);
+  if (duplicated) return;
+  list.push(media);
+  if (list.length > 12) {
+    list.splice(0, list.length - 12);
+  }
+  mediaByWaId.set(waId, list);
 }
 
 function normalizeAssistantReply(text) {
@@ -121,6 +146,12 @@ function isClosingCue(text) {
   );
 }
 
+function isInitialGreeting(text) {
+  const clean = (text || "").trim().toLowerCase();
+  if (!clean) return false;
+  return /^(hola|buenas|buenos d[ií]as|buenas tardes|buenas noches)(\b|[,.!\s])/.test(clean);
+}
+
 function isPrivacyRefusal(text) {
   return /\b(privad[oa]|no (quiero|deseo|puedo)|primero (la )?cotizaci[oó]n|luego coordinamos|no compartir|no dar)\b/i.test(
     text || ""
@@ -129,6 +160,32 @@ function isPrivacyRefusal(text) {
 
 function isImageStubbornRequest(text) {
   return /\b(igual|similar|tal cual|exactamente igual|como la imagen|como en la imagen|solo eso|nada m[aá]s|sin detalles|no dar detalles)\b/i.test(
+    text || ""
+  );
+}
+
+function isRequestingServicesCatalogOrVisualRefs(text) {
+  const t = (text || "").toLowerCase();
+  if (!t.trim()) return false;
+  const asksVisual =
+    /\b(qu[eé] (?:hacen|trabajos|servicios)|tipos? de trabajos?|informaci[oó]n (?:sobre )?(?:los )?trabajos?|cat[aá]logo|galer[ií]a|fotos?|im[aá]genes?|referencias? visuales?|diseños?|modelos?|ejemplos?|muestras?|ver (?:trabajos|modelos|fotos|diseños))\b/i.test(
+      t
+    );
+  const asksLinks =
+    /\b(p[aá]gina|web|sitio|facebook|fb|redes?)\b/i.test(t) &&
+    /\b(ver|mostrar|pasar|compart|enlace|link|url)\b/i.test(t);
+  return asksVisual || asksLinks;
+}
+
+function companyInfoAndVisualRefsReply() {
+  return (
+    `Claro. Para ver trabajos y referencias visuales podés revisar nuestra web ${COMPANY_WEB_URL} y el perfil de Facebook ${COMPANY_FB_URL}. ` +
+    `Cuando quieras cotizar, contame producto, medidas, cantidad y si es para hogar o empresa`
+  );
+}
+
+function isAlreadyProvidedPushback(text) {
+  return /\b(ya (?:te )?lo (?:mencion\w*|dije|indiqu\w*|enseñ\w*)|te lo (?:acabo de |ya )?mencion\w*|repet[ií]s|me preguntas lo mismo|no me (?:entiendes|escuchas))\b/i.test(
     text || ""
   );
 }
@@ -143,10 +200,188 @@ function getClientDataSignals(waId) {
     blob
   );
   const hasTech = /(metro|medida|alto|ancho|material|acabado|pintura|imagen referencial|m2|m²)/i.test(blob);
-  const hasScope = /(hogar|dom[eé]stic|industrial|empresa)/i.test(blob);
-  const hasId = /(ruc|mi nombre es|nombre completo|soy [a-záéíóúñ])/i.test(blob);
+  const hasScope =
+    /(hogar|dom[eé]stic|industrial|empresa)/i.test(blob) ||
+    /\b(colegio|escuela|instituci[oó]n|negocio|local|oficina|planta|f[aá]brica|obra|taller)\b/i.test(blob);
+  const hasId = /(ruc|mi nombre es|me llamo|nombre completo|soy [a-záéíóúñ])/i.test(blob);
   const hasAddress = /(direcci[oó]n|ubicaci[oó]n|avenida|av\.|jr\.|calle|sector|referencia|cerca de|lugar)/i.test(blob);
   return { blob, hasProduct, hasTech, hasScope, hasId, hasAddress };
+}
+
+function getRequiredFollowupQuestion(waId) {
+  const { hasProduct, hasTech, hasScope, hasId, hasAddress } = getClientDataSignals(waId);
+  const hasQty = hasLogicalQuantity(waId);
+
+  // Si ya tenemos base técnica/comercial, fuerza pedir identificación antes del cierre.
+  if (hasProduct && hasScope && hasTech && hasQty && !hasId) {
+    return "Muy bien, para continuar con la cotización formal, compartime por favor tu RUC. Si no tienes RUC, indícame tu nombre completo";
+  }
+
+  // Luego fuerza ubicación para completar datos de cotización.
+  if (hasProduct && hasScope && hasTech && hasQty && hasId && !hasAddress) {
+    return "Perfecto, ahora indícame por favor la dirección exacta del trabajo y una referencia para ubicar el lugar";
+  }
+
+  return null;
+}
+
+function getPromptForMissingField(field) {
+  if (field === "tipo de trabajo/producto") {
+    return "Muy bien, para continuar, qué tipo de trabajo o producto necesitas fabricar o instalar?";
+  }
+  if (field === "ámbito (hogar/doméstico o empresa/industrial)") {
+    return "Perfecto, para avanzar, confirmame por favor si es para hogar/doméstico o para empresa/industrial";
+  }
+  if (field === "detalle técnico (medidas, material, acabado o referencia)") {
+    return "Muy bien, ahora compartime por favor medidas aproximadas, material y acabado. Si tienes imagen referencial, también puedes enviarla";
+  }
+  if (field === "cantidad") {
+    return "Perfecto, para completar la cotización, indícame la cantidad exacta que necesitas";
+  }
+  if (field === "identificación (RUC o nombre completo)") {
+    return "Muy bien, para continuar con la cotización formal, compartime por favor tu RUC. Si no tienes RUC, indícame tu nombre completo";
+  }
+  if (field === "dirección y referencia") {
+    return "Perfecto, ahora indícame por favor la dirección exacta del trabajo y una referencia para ubicar el lugar";
+  }
+  return null;
+}
+
+function getAskedFieldFromReply(reply) {
+  const text = (reply || "").toLowerCase();
+  if (!text) return null;
+  if (/(hogar|dom[eé]stic|empresa|industrial|[áa]mbito)/i.test(text)) {
+    return "ámbito (hogar/doméstico o empresa/industrial)";
+  }
+  if (/(tipo de trabajo|producto necesitas|fabricar o instalar)/i.test(text)) {
+    return "tipo de trabajo/producto";
+  }
+  if (/(medidas|material|acabado|pintura|referencia visual|imagen referencial)/i.test(text)) {
+    return "detalle técnico (medidas, material, acabado o referencia)";
+  }
+  if (/(cu[aá]nt|cantidad|unidades|piezas|paños|tramos|[áa]reas)/i.test(text)) {
+    return "cantidad";
+  }
+  if (/(ruc|nombre completo|identificaci[oó]n)/i.test(text)) {
+    return "identificación (RUC o nombre completo)";
+  }
+  if (/(direcci[oó]n|ubicaci[oó]n|referencia|cerca de)/i.test(text)) {
+    return "dirección y referencia";
+  }
+  return null;
+}
+
+function enforceNoRepeatedQuestion(waId, reply) {
+  const askedField = getAskedFieldFromReply(reply);
+  if (!askedField) return reply;
+
+  const missingGuide = getNextMissingDataPrompt(waId);
+  const askedAlreadyResolved = !missingGuide.missing.includes(askedField);
+  if (!askedAlreadyResolved) return reply;
+
+  const replacement = getPromptForMissingField(missingGuide.next);
+  if (replacement) return replacement;
+  return "Perfecto, continuemos con el siguiente detalle para tu cotización";
+}
+
+function getLeadForwardTo(from) {
+  const envTarget = (process.env.LEAD_FORWARD_TO || "").replace(/\D/g, "");
+  if (envTarget) return envTarget;
+  return (from || "").replace(/\D/g, "");
+}
+
+function inferWorkTitle(waId) {
+  const blob = getFlattenedUserText(waId).toLowerCase();
+  if (/(techo|techado|techar)/i.test(blob)) return "COTIZACION DE TECHADO";
+  if (/(cerco|cercado|cercar)/i.test(blob)) return "COTIZACION DE CERCO";
+  if (/(reja|baranda|port[oó]n|puerta|ventana)/i.test(blob)) return "COTIZACION DE HERRERIA";
+  if (/(mueble|muebler[ií]a|silla|mesa)/i.test(blob)) return "COTIZACION DE MOBILIARIO METALICO";
+  return "NUEVA SOLICITUD DE COTIZACION";
+}
+
+function normalizePhoneForDisplay(raw) {
+  const digits = (raw || "").replace(/\D/g, "");
+  if (!digits) return "No disponible";
+  return `+${digits}`;
+}
+
+async function generateLeadForwardText(waId, clientWaId) {
+  const summary = (await generateSpecsSummary(waId)) || "Resumen no disponible";
+  const title = inferWorkTitle(waId);
+  return [
+    title,
+    "",
+    `Cliente: ${normalizePhoneForDisplay(clientWaId)}`,
+    "",
+    "DATOS RECOPILADOS:",
+    summary,
+  ].join("\n");
+}
+
+async function sendMediaById(to, mediaType, mediaId, caption) {
+  const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const access = process.env.WHATSAPP_ACCESS_TOKEN;
+  if (!phoneId || !access || !to || !mediaType || !mediaId) return;
+
+  const normalizedType = mediaType === "document" ? "document" : "image";
+  const url = `https://graph.facebook.com/${GRAPH_VERSION}/${phoneId}/messages`;
+  const payload = {
+    messaging_product: "whatsapp",
+    to,
+    type: normalizedType,
+    [normalizedType]: {
+      id: mediaId,
+    },
+  };
+  if (caption && normalizedType === "image") {
+    payload.image.caption = caption.slice(0, 900);
+  }
+  if (caption && normalizedType === "document") {
+    payload.document.caption = caption.slice(0, 900);
+  }
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${access}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const raw = await r.text();
+  if (!r.ok) {
+    console.error("Graph API media error", r.status, raw);
+  }
+}
+
+async function forwardLeadPackage(waId, clientWaId) {
+  const to = getLeadForwardTo(clientWaId);
+  if (!to) return;
+
+  const leadText = await generateLeadForwardText(waId, clientWaId);
+  await sendTextReply(to, leadText);
+
+  const attachments = getInboundMedia(waId);
+  for (const media of attachments) {
+    if (!media?.id || !media?.type) continue;
+    await sendMediaById(to, media.type, media.id, media.caption || "Adjunto enviado por el cliente");
+  }
+}
+
+function getNextMissingDataPrompt(waId) {
+  const { hasProduct, hasTech, hasScope, hasId, hasAddress } = getClientDataSignals(waId);
+  const hasQty = hasLogicalQuantity(waId);
+  const missing = [];
+  if (!hasProduct) missing.push("tipo de trabajo/producto");
+  if (!hasScope) missing.push("ámbito (hogar/doméstico o empresa/industrial)");
+  if (!hasTech) missing.push("detalle técnico (medidas, material, acabado o referencia)");
+  if (!hasQty) missing.push("cantidad");
+  if (!hasId) missing.push("identificación (RUC o nombre completo)");
+  if (!hasAddress) missing.push("dirección y referencia");
+
+  const next = missing[0] || "ninguno";
+  return { missing, next };
 }
 
 function hasLogicalQuantity(waId) {
@@ -154,21 +389,31 @@ function hasLogicalQuantity(waId) {
   const isAreaWork = /(techo|techado|techar|cerco|cercado|cercar)/i.test(blob);
 
   // Detecta cantidades numéricas explícitas desde el inicio:
-  // ej: "100 sillas", "50 mesas", "2 portones", "3 paños", "x2", "2x".
+  // ej: "100 sillas", "50 mesas", "2 portones", "3 paños", "215 purtas" (typo), "x2", "2x".
   const hasNumericUnits =
-    /\b\d+\s*(unidad(?:es)?|pieza(?:s)?|paño(?:s)?|hoja(?:s)?|juego(?:s)?|silla(?:s)?|mesa(?:s)?|port[oó]n(?:es)?|puerta(?:s)?|ventana(?:s)?|reja(?:s)?|baranda(?:s)?|mueble(?:s)?|afiche(?:s)?)\b/i.test(
+    /\b\d+\s*(unidad(?:es)?|pieza(?:s)?|paño(?:s)?|hoja(?:s)?|juego(?:s)?|silla(?:s)?|mesa(?:s)?|port[oó]n(?:es)?|puerta(?:s)?|purtas?|ventana(?:s)?|reja(?:s)?|baranda(?:s)?|mueble(?:s)?|afiche(?:s)?)\b/i.test(
       blob
     ) ||
     /\b(x\s*\d+|\d+\s*x)\b/i.test(blob);
+
+  // Número + producto cercano (errores de tipeo, orden libre): "215 purtas de 1.9 m", "cotizar 215 puertas".
+  const hasNumericNearProduct =
+    /\b\d{1,5}\b\s*\D{0,30}\b(?:puert|purt|port[oó]|ventan|mesas?|sillas?|rejas?|barandas?|unidades?|piezas?|muebles?)\w*\b/i.test(
+      blob
+    ) || /\bcotiz\w*\s+\d{1,5}\b/i.test(blob);
+
+  const hasNumericUnitsOrNear = hasNumericUnits || hasNumericNearProduct;
 
   if (isAreaWork) {
     return (
       /(área|area|m2|m²|metros cuadrados|sector|sectores|tramo|tramos|frente|perímetro|perimetro)/i.test(
         blob
-      ) || hasNumericUnits
+      ) || hasNumericUnitsOrNear
     );
   }
-  return /(unidad|unidades|cantidad|pieza|piezas|paño|paños|hoja|hojas|juego|juegos)/i.test(blob) || hasNumericUnits;
+  return (
+    /(unidad|unidades|cantidad|pieza|piezas|paño|paños|hoja|hojas|juego|juegos)/i.test(blob) || hasNumericUnitsOrNear
+  );
 }
 
 function getLogicalQuantityQuestion(waId) {
@@ -195,6 +440,38 @@ function decorateReply(reply, { isFirst, shouldClose }) {
   return clean;
 }
 
+function stripPresentation(text) {
+  if (!text) return text;
+  return text
+    .replace(
+      /(^|[\n.\s])(?:hola|buenas|buenos d[ií]as|buenas tardes|buenas noches)[^.\n]{0,140}?(?:soy|me llamo)\s+gladis[^.\n]*[.\n]*/gi,
+      "$1"
+    )
+    .replace(/(^|[\n.\s])(?:soy|me llamo)\s+gladis[^.\n]*[.\n]*/gi, "$1")
+    .replace(
+      /(^|[\n.\s])asistente comercial de (?:metaltec\s*-\s*)?comercial bautista[^.\n]*[.\n]*/gi,
+      "$1"
+    )
+    .replace(/\s{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function enforceSingleIntroPolicy(waId, reply, { allowIntro = false } = {}) {
+  const introLine = GLADIS_INTRO_LINE;
+  const history = getConversationHistory(waId);
+  const assistantTurns = history.filter((m) => m.role === "assistant").length;
+
+  if (assistantTurns === 0 && allowIntro) {
+    const withoutPresentation = stripPresentation(reply);
+    if (!withoutPresentation) return introLine;
+    return `${introLine} ${withoutPresentation}`.trim();
+  }
+
+  const sanitized = stripPresentation(reply);
+  return sanitized || "Muy bien, continuemos con tu solicitud";
+}
+
 function markProcessedMessage(id) {
   if (!id) return false;
   const now = Date.now();
@@ -218,7 +495,15 @@ function extractTextMessages(body) {
       if (!value?.messages) continue;
       for (const msg of value.messages) {
         if (msg.type === "text" && msg.text?.body && msg.from) {
-          out.push({ from: msg.from, body: msg.text.body, id: msg.id, type: "text", mediaId: null });
+          out.push({
+            from: msg.from,
+            body: msg.text.body,
+            id: msg.id,
+            type: "text",
+            mediaId: null,
+            mediaType: null,
+            mediaCaption: null,
+          });
           continue;
         }
         if (msg.type === "image" && msg.from) {
@@ -232,6 +517,25 @@ function extractTextMessages(body) {
             id: msg.id,
             type: "image",
             mediaId: msg.image?.id || null,
+            mediaType: "image",
+            mediaCaption: caption || "Imagen referencial del cliente",
+          });
+          continue;
+        }
+        if (msg.type === "document" && msg.from) {
+          const caption = msg.document?.caption?.trim();
+          const filename = msg.document?.filename?.trim() || "archivo";
+          const docText = caption
+            ? `Documento enviado por el cliente (${filename}). Mensaje del cliente: ${caption}`
+            : `Documento enviado por el cliente: ${filename}`;
+          out.push({
+            from: msg.from,
+            body: docText,
+            id: msg.id,
+            type: "document",
+            mediaId: msg.document?.id || null,
+            mediaType: "document",
+            mediaCaption: caption || `Documento del cliente: ${filename}`,
           });
         }
       }
@@ -284,7 +588,8 @@ async function generateImageDescriptionReply(waId, mediaId, userText) {
 
   const visionPrompt =
     "Describe solo detalles visibles de la imagen para cotización (tipo de estructura, material aparente, acabado/color, medidas estimadas visuales si aplica, complejidad). " +
-    "No inventes medidas exactas ni datos no visibles. Escribe breve y pide confirmación del cliente.";
+    "No inventes medidas exactas ni datos no visibles. Escribe breve y pide confirmación del cliente. " +
+    `Si el cliente pide más referencias visuales, menciona la web ${COMPANY_WEB_URL} y Facebook ${COMPANY_FB_URL} en texto plano.`;
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -333,6 +638,7 @@ async function generateAssistantReply(waId, userText, isFirst) {
 
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
   const history = getConversationHistory(waId);
+  const missingGuide = getNextMissingDataPrompt(waId);
   const behaviorPrompt = isFirst
     ? "Si y solo si el cliente envía un saludo inicial breve (hola/buenas), preséntate como Gladis en esta respuesta. Si el cliente ya viene con contexto o está respondiendo datos, NO te presentes."
     : "NO te vuelvas a presentar. Ya te presentaste antes. Continúa la conversación sin reiniciar.";
@@ -354,6 +660,14 @@ async function generateAssistantReply(waId, userText, isFirst) {
           content:
             `${behaviorPrompt} No repitas preguntas si el cliente ya dio ese dato. ` +
             "Antes de preguntar, revisa el historial y pide solo el siguiente dato faltante.",
+        },
+        {
+          role: "system",
+          content:
+            "Estado de datos detectado en el historial del cliente. " +
+            `Faltantes actuales: ${missingGuide.missing.length ? missingGuide.missing.join(", ") : "ninguno"}. ` +
+            `Siguiente único dato a solicitar (si corresponde): ${missingGuide.next}. ` +
+            "Regla estricta: si un dato NO está en faltantes, no lo vuelvas a preguntar.",
         },
         ...history,
         { role: "user", content: userText },
@@ -471,12 +785,16 @@ async function processInbound(body) {
   const texts = extractTextMessages(body);
   const waitMs = getAssistantDelayMs();
 
-  for (const { from, body: msgBody, id, type, mediaId } of texts) {
+  for (const { from, body: msgBody, id, type, mediaId, mediaType, mediaCaption } of texts) {
     try {
       if (markProcessedMessage(id)) continue;
 
     const isFirst = !seenWaId.has(from);
     seenWaId.set(from, true);
+    const allowIntro = isFirst && type === "text" && isInitialGreeting(msgBody);
+    if (mediaId && mediaType) {
+      appendInboundMedia(from, { id: mediaId, type: mediaType, caption: mediaCaption || "" });
+    }
 
     if (waitMs > 0) await delay(waitMs);
 
@@ -513,6 +831,7 @@ async function processInbound(body) {
         confirmReply =
           "Perfecto, recibimos tu CONFIRMO. Quedan validadas las especificaciones y procederemos con la cotización formal a la brevedad";
         confirmationStateByWaId.set(from, { awaiting: false });
+        await forwardLeadPackage(from, from);
       } else {
         confirmReply =
           "Para continuar, por favor responde exactamente CONFIRMO en mayúsculas si el resumen de especificaciones es correcto";
@@ -529,7 +848,9 @@ async function processInbound(body) {
 
     let reply;
     if (isHumanOrAiQuestion(msgBody)) {
-      reply = "Soy asistente de COMERCIAL BAUTISTA";
+      reply = "Soy asistente de METALTEC - COMERCIAL BAUTISTA";
+    } else if (isRequestingServicesCatalogOrVisualRefs(msgBody)) {
+      reply = companyInfoAndVisualRefsReply();
     } else if (isPrivacyRefusal(msgBody)) {
       reply =
         "Entiendo, no hay problema. Podemos avanzar con una cotización referencial sin tu dirección exacta por ahora. Para afinar el estimado, solo confirmame el tipo de trabajo, medidas aproximadas y acabado, y luego coordinamos ubicación cuando te sea cómodo";
@@ -544,12 +865,34 @@ async function processInbound(body) {
 
     appendConversationTurn(from, "user", msgBody);
 
+    if (isAlreadyProvidedPushback(msgBody)) {
+      const guide = getNextMissingDataPrompt(from);
+      let recovery = "Disculpa la confusión, tomé nota de lo que ya enviaste. ";
+      const nextQ = guide.next !== "ninguno" ? getPromptForMissingField(guide.next) : null;
+      recovery += nextQ || "Seguimos con tu cotización con lo que ya registramos";
+      recovery = enforceNoRepeatedQuestion(from, recovery);
+      recovery = enforceSingleIntroPolicy(from, recovery, { allowIntro: false });
+      recovery = decorateReply(recovery, { isFirst, shouldClose: false });
+      appendConversationTurn(from, "assistant", recovery);
+      await sendTextReply(from, recovery);
+      continue;
+    }
+
     // Pregunta lógica de cantidad según el tipo de trabajo antes de cerrar/resumir.
     const qtyQuestion = getLogicalQuantityQuestion(from);
     if (qtyQuestion) {
       const decoratedQty = decorateReply(qtyQuestion, { isFirst, shouldClose: false });
       appendConversationTurn(from, "assistant", decoratedQty);
       await sendTextReply(from, decoratedQty);
+      continue;
+    }
+
+    // Fuerza preguntas críticas faltantes para no omitir nombre/RUC o dirección.
+    const requiredFollowup = getRequiredFollowupQuestion(from);
+    if (requiredFollowup) {
+      const decoratedRequired = decorateReply(requiredFollowup, { isFirst, shouldClose: false });
+      appendConversationTurn(from, "assistant", decoratedRequired);
+      await sendTextReply(from, decoratedRequired);
       continue;
     }
 
@@ -569,6 +912,8 @@ async function processInbound(body) {
       }
     }
 
+    reply = enforceNoRepeatedQuestion(from, reply);
+    reply = enforceSingleIntroPolicy(from, reply, { allowIntro });
     reply = decorateReply(reply, { isFirst, shouldClose: isClosingCue(msgBody) });
     appendConversationTurn(from, "assistant", reply);
       await sendTextReply(from, reply);
