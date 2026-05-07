@@ -459,7 +459,8 @@ async function processInbound(body) {
   const waitMs = getAssistantDelayMs();
 
   for (const { from, body: msgBody, id, type, mediaId } of texts) {
-    if (markProcessedMessage(id)) continue;
+    try {
+      if (markProcessedMessage(id)) continue;
 
     const isFirst = !seenWaId.has(from);
     seenWaId.set(from, true);
@@ -557,7 +558,21 @@ async function processInbound(body) {
 
     reply = decorateReply(reply, { isFirst, shouldClose: isClosingCue(msgBody) });
     appendConversationTurn(from, "assistant", reply);
-    await sendTextReply(from, reply);
+      await sendTextReply(from, reply);
+    } catch (e) {
+      console.error("Loop message processing error:", e);
+      // Fail-safe: evita dejar al cliente sin respuesta ante errores de visión/API.
+      try {
+        if (from) {
+          await sendTextReply(
+            from,
+            "Disculpa, tuvimos un inconveniente momentáneo procesando tu mensaje. Si gustas, intenta nuevamente en unos segundos"
+          );
+        }
+      } catch (inner) {
+        console.error("Fail-safe send error:", inner);
+      }
+    }
   }
 }
 
