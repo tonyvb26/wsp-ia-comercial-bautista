@@ -21,6 +21,7 @@ const MAX_HISTORY_TURNS = 12;
 const seenWaId = new Map();
 const conversationByWaId = new Map();
 const processedMessageIds = new Map();
+const confirmationStateByWaId = new Map();
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -59,6 +60,7 @@ Información que debes obtener (en orden lógico, sin sonar a formulario frío)
 
 Cierre cuando ya tengas lo necesario
 Cuando tengas los datos suficientes para iniciar una cotización formal, explica con cordialidad que con esa información el equipo preparará la cotización a la brevedad posible, y que si necesitan algún detalle adicional te volverás a comunicar con él para afinar sin complicarlo.
+Antes de cerrar, muestra un resumen claro de especificaciones del trabajo y pide al cliente que confirme escribiendo exactamente CONFIRMO en mayúsculas.
 
 Si el cliente solo saluda o da poca información, guiá con una o dos preguntas abiertas y cálidas para avanzar.`;
 
@@ -74,6 +76,11 @@ function appendConversationTurn(waId, role, content) {
     history.splice(0, history.length - MAX_HISTORY_TURNS);
   }
   conversationByWaId.set(waId, history);
+}
+
+function getFlattenedConversationText(waId) {
+  const history = getConversationHistory(waId);
+  return history.map((m) => `${m.role}: ${m.content}`).join("\n");
 }
 
 function normalizeAssistantReply(text) {
@@ -109,6 +116,18 @@ function isPrivacyRefusal(text) {
   return /\b(privad[oa]|no (quiero|deseo|puedo)|primero (la )?cotizaci[oó]n|luego coordinamos|no compartir|no dar)\b/i.test(
     text || ""
   );
+}
+
+function isConfirmMessage(text) {
+  return /\bCONFIRMO\b/.test(text || "");
+}
+
+function hasEnoughInfoForSpecConfirmation(waId) {
+  const blob = getFlattenedConversationText(waId).toLowerCase();
+  const hasProduct = /(techo|reja|baranda|puerta|ventana|estructura|mueble|afiche|gr[úu]a|trabajo|producto)/i.test(blob);
+  const hasTech = /(metro|medida|alto|ancho|material|acabado|pintura|unidad|cantidad|imagen referencial)/i.test(blob);
+  const hasId = /(ruc|mi nombre es|nombre completo|soy [a-záéíóúñ])/i.test(blob);
+  return hasProduct && hasTech && hasId;
 }
 
 function decorateReply(reply, { isFirst, shouldClose }) {
@@ -209,6 +228,52 @@ async function generateAssistantReply(waId, userText, isFirst) {
   return normalizeAssistantReply(text);
 }
 
+async function generateSpecsSummary(waId) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const convo = getFlattenedConversationText(waId);
+
+  const prompt = [
+    "Resume solo las especificaciones del trabajo brindadas por el cliente.",
+    "Devuelve 4 a 7 líneas breves, sin inventar datos.",
+    "Incluye: tipo de trabajo, medidas, material/acabado, cantidad, tipo hogar/industrial, nombre o RUC y ubicación/referencia si existe.",
+    "Si un campo no existe, no lo inventes.",
+    "No saludes ni cierres.",
+  ].join(" ");
+
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.2,
+      max_tokens: 350,
+      messages: [
+        { role: "system", content: prompt },
+        { role: "user", content: convo },
+      ],
+    }),
+  });
+
+  const raw = await r.text();
+  if (!r.ok) {
+    console.error("OpenAI resumen error", r.status, raw);
+    return null;
+  }
+
+  try {
+    const data = JSON.parse(raw);
+    const text = data.choices?.[0]?.message?.content?.trim();
+    return text ? normalizeAssistantReply(text) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function sendTextReply(to, text) {
   const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
   const access = process.env.WHATSAPP_ACCESS_TOKEN;
@@ -262,6 +327,27 @@ async function processInbound(body) {
 
     if (waitMs > 0) await delay(waitMs);
 
+    const confirmState = confirmationStateByWaId.get(from);
+    if (confirmState?.awaiting) {
+      let confirmReply;
+      if (isConfirmMessage(msgBody)) {
+        confirmReply =
+          "Perfecto, recibimos tu CONFIRMO. Quedan validadas las especificaciones y procederemos con la cotización formal a la brevedad";
+        confirmationStateByWaId.set(from, { awaiting: false });
+      } else {
+        confirmReply =
+          "Para continuar, por favor responde exactamente CONFIRMO en mayúsculas si el resumen de especificaciones es correcto";
+      }
+      confirmReply = decorateReply(confirmReply, {
+        isFirst: false,
+        shouldClose: false,
+      });
+      appendConversationTurn(from, "user", msgBody);
+      appendConversationTurn(from, "assistant", confirmReply);
+      await sendTextReply(from, confirmReply);
+      continue;
+    }
+
     let reply;
     if (isHumanOrAiQuestion(msgBody)) {
       reply = "Soy asistente de COMERCIAL BAUTISTA";
@@ -274,8 +360,26 @@ async function processInbound(body) {
     if (!reply) {
       reply = "Gracias por escribirnos. Ya vimos tu mensaje y en breve te seguimos por aquí.";
     }
-    reply = decorateReply(reply, { isFirst, shouldClose: isClosingCue(msgBody) });
+
     appendConversationTurn(from, "user", msgBody);
+
+    // Si ya hay información suficiente, primero pedimos confirmación formal del resumen.
+    if (hasEnoughInfoForSpecConfirmation(from)) {
+      const summary = await generateSpecsSummary(from);
+      if (summary) {
+        const askConfirm =
+          `Muy bien, para validar tu solicitud te comparto el resumen de especificaciones:\n` +
+          `${summary}\n\n` +
+          `Si todo está correcto, responde exactamente CONFIRMO en mayúsculas`;
+        const decoratedSummary = decorateReply(askConfirm, { isFirst, shouldClose: false });
+        appendConversationTurn(from, "assistant", decoratedSummary);
+        confirmationStateByWaId.set(from, { awaiting: true });
+        await sendTextReply(from, decoratedSummary);
+        continue;
+      }
+    }
+
+    reply = decorateReply(reply, { isFirst, shouldClose: isClosingCue(msgBody) });
     appendConversationTurn(from, "assistant", reply);
     await sendTextReply(from, reply);
   }
