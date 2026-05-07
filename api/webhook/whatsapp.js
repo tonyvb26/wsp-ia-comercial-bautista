@@ -22,6 +22,7 @@ const seenWaId = new Map();
 const conversationByWaId = new Map();
 const processedMessageIds = new Map();
 const confirmationStateByWaId = new Map();
+const imageStateByWaId = new Map();
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -126,6 +127,12 @@ function isPrivacyRefusal(text) {
   );
 }
 
+function isImageStubbornRequest(text) {
+  return /\b(igual|similar|tal cual|exactamente igual|como la imagen|como en la imagen|solo eso|nada m[aá]s|sin detalles|no dar detalles)\b/i.test(
+    text || ""
+  );
+}
+
 function isConfirmMessage(text) {
   return /\bCONFIRMO\b/.test(text || "");
 }
@@ -198,7 +205,7 @@ function extractTextMessages(body) {
       if (!value?.messages) continue;
       for (const msg of value.messages) {
         if (msg.type === "text" && msg.text?.body && msg.from) {
-          out.push({ from: msg.from, body: msg.text.body, id: msg.id, type: "text" });
+          out.push({ from: msg.from, body: msg.text.body, id: msg.id, type: "text", mediaId: null });
           continue;
         }
         if (msg.type === "image" && msg.from) {
@@ -206,12 +213,105 @@ function extractTextMessages(body) {
           const imageText = caption
             ? `Imagen referencial enviada. Mensaje del cliente: ${caption}`
             : "Imagen referencial enviada por el cliente";
-          out.push({ from: msg.from, body: imageText, id: msg.id, type: "image" });
+          out.push({
+            from: msg.from,
+            body: imageText,
+            id: msg.id,
+            type: "image",
+            mediaId: msg.image?.id || null,
+          });
         }
       }
     }
   }
   return out;
+}
+
+async function getWhatsAppMediaDataUrl(mediaId) {
+  const access = process.env.WHATSAPP_ACCESS_TOKEN;
+  if (!mediaId || !access) return null;
+
+  const metaRes = await fetch(`https://graph.facebook.com/${GRAPH_VERSION}/${mediaId}`, {
+    headers: { Authorization: `Bearer ${access}` },
+  });
+  const metaRaw = await metaRes.text();
+  if (!metaRes.ok) {
+    console.error("Media meta error", metaRes.status, metaRaw);
+    return null;
+  }
+
+  let meta;
+  try {
+    meta = JSON.parse(metaRaw);
+  } catch {
+    return null;
+  }
+
+  if (!meta?.url) return null;
+  const binRes = await fetch(meta.url, {
+    headers: { Authorization: `Bearer ${access}` },
+  });
+  if (!binRes.ok) {
+    const raw = await binRes.text();
+    console.error("Media download error", binRes.status, raw);
+    return null;
+  }
+  const mime = meta.mime_type || "image/jpeg";
+  const arr = await binRes.arrayBuffer();
+  const b64 = Buffer.from(arr).toString("base64");
+  return `data:${mime};base64,${b64}`;
+}
+
+async function generateImageDescriptionReply(waId, mediaId, userText) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey || !mediaId) return null;
+  const model = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const imageDataUrl = await getWhatsAppMediaDataUrl(mediaId);
+  if (!imageDataUrl) return null;
+
+  const visionPrompt =
+    "Describe solo detalles visibles de la imagen para cotización (tipo de estructura, material aparente, acabado/color, medidas estimadas visuales si aplica, complejidad). " +
+    "No inventes medidas exactas ni datos no visibles. Escribe breve y pide confirmación del cliente.";
+
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.3,
+      max_tokens: 450,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: visionPrompt },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: `Contexto cliente: ${userText || "Sin detalle adicional"}` },
+            { type: "image_url", image_url: { url: imageDataUrl } },
+          ],
+        },
+      ],
+    }),
+  });
+
+  const raw = await r.text();
+  if (!r.ok) {
+    console.error("OpenAI vision error", r.status, raw);
+    return null;
+  }
+  try {
+    const data = JSON.parse(raw);
+    const text = data.choices?.[0]?.message?.content?.trim();
+    if (!text) return null;
+    return normalizeAssistantReply(
+      `${text}\n\nSi esta descripción coincide con lo que necesitas, confirmame y seguimos con la cotización`
+    );
+  } catch {
+    return null;
+  }
 }
 
 async function generateAssistantReply(waId, userText, isFirst) {
@@ -358,13 +458,39 @@ async function processInbound(body) {
   const texts = extractTextMessages(body);
   const waitMs = getAssistantDelayMs();
 
-  for (const { from, body: msgBody, id } of texts) {
+  for (const { from, body: msgBody, id, type, mediaId } of texts) {
     if (markProcessedMessage(id)) continue;
 
     const isFirst = !seenWaId.has(from);
     seenWaId.set(from, true);
 
     if (waitMs > 0) await delay(waitMs);
+
+    const imageState = imageStateByWaId.get(from) || { count: 0, lastMediaId: null };
+    if (type === "image") {
+      if (mediaId && mediaId !== imageState.lastMediaId) {
+        imageState.count += 1;
+        imageState.lastMediaId = mediaId;
+        imageStateByWaId.set(from, imageState);
+      }
+      if (imageState.count > 2) {
+        const limitReply =
+          "Perfecto, ya recibí 2 imágenes en este chat. Para continuar, trabajemos con esas referencias y el detalle técnico en texto";
+        appendConversationTurn(from, "user", msgBody);
+        appendConversationTurn(from, "assistant", limitReply);
+        await sendTextReply(from, decorateReply(limitReply, { isFirst, shouldClose: false }));
+        continue;
+      }
+      // Primera mano: pedir detalles antes de analizar imagen.
+      const askDetail =
+        "Muy bien, ya recibí tu imagen referencial. Contame por favor qué necesitas exactamente: medidas aproximadas, material y acabado. Si deseas algo igual a la imagen, también indícamelo";
+      if (!msgBody || /imagen referencial enviada por el cliente/i.test(msgBody)) {
+        appendConversationTurn(from, "user", msgBody);
+        appendConversationTurn(from, "assistant", askDetail);
+        await sendTextReply(from, decorateReply(askDetail, { isFirst, shouldClose: false }));
+        continue;
+      }
+    }
 
     const confirmState = confirmationStateByWaId.get(from);
     if (confirmState?.awaiting) {
@@ -393,6 +519,8 @@ async function processInbound(body) {
     } else if (isPrivacyRefusal(msgBody)) {
       reply =
         "Entiendo, no hay problema. Podemos avanzar con una cotización referencial sin tu dirección exacta por ahora. Para afinar el estimado, solo confirmame el tipo de trabajo, medidas aproximadas y acabado, y luego coordinamos ubicación cuando te sea cómodo";
+    } else if (isImageStubbornRequest(msgBody) && imageState.lastMediaId && imageState.count <= 2) {
+      reply = await generateImageDescriptionReply(from, imageState.lastMediaId, msgBody);
     } else {
       reply = await generateAssistantReply(from, msgBody, isFirst);
     }
