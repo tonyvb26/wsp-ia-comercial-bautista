@@ -1,0 +1,6 @@
+{
+  "rewrites": [
+    { "source": "/webhook/whatsapp", "destination": "/api/webhook/whatsapp" },
+    { "source": "/health", "destination": "/api/health" }
+  ]
+}

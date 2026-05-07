@@ -1,0 +1,23 @@
+OBJETIVOS DEL PROYECTO DE AUTOMATIZACIÓN INTELIGENTE DE WHATSAPP BUSINESS
+
+El propósito central de esta iniciativa es transformar la primera interacción con los clientes mediante la implementación de un sistema de comunicación automatizado que rompa con la rigidez de los bots convencionales. El objetivo es lograr una experiencia de usuario fluida, empática y profundamente profesional que actúe como la cara visible del negocio.
+
+A continuación, se detallan los objetivos específicos que se pretenden alcanzar:
+
+1. Naturalidad y Humanización del Diálogo:
+El objetivo principal es que el cliente no perciba que está interactuando con un sistema automatizado de opciones cerradas. Se busca que la inteligencia artificial mantenga una conversación fluida, utilizando un lenguaje natural, cercano y profesional. La IA debe ser capaz de entender el contexto, las dudas y la forma de expresarse de cada persona, respondiendo de manera coherente, amigable y, sobre todo, no robótica.
+
+2. Gestión Proactiva de la Conversación:
+Se busca que el sistema no sea un ente pasivo que solo responde preguntas, sino que actúe como un gestor comercial capacitado. La IA debe tener la habilidad de conducir la conversación de forma sutil, manteniendo siempre el hilo conductor hacia el propósito comercial, asegurando que el flujo de la charla sea productivo y agradable para el usuario.
+
+3. Recolección Inteligente de Información Crítica:
+Uno de los pilares del proyecto es que la IA actúe como un primer filtro cualificador. El sistema debe ser capaz de identificar y solicitar al cliente, de manera orgánica durante la charla, todos los datos necesarios para una evaluación posterior. No se trata de presentar un formulario frío, sino de obtener detalles clave (como el tipo de servicio requerido, especificaciones del proyecto o datos de contacto) a través de una interacción genuina.
+
+4. Síntesis y Estructuración de Datos para el Usuario Final:
+El sistema tiene como objetivo final facilitar el trabajo del propietario. Una vez que la IA ha recopilado la información necesaria, debe ser capaz de procesar toda la charla para generar un resumen ejecutivo claro y conciso. Este resumen debe permitir comprender el perfil y la necesidad del cliente de un solo vistazo, sin necesidad de leer todo el historial del chat.
+
+5. Optimización del Tiempo de Respuesta y Disponibilidad Total:
+Se busca garantizar que ningún cliente quede sin atención inmediata, independientemente de la hora del día o la carga de trabajo. La IA debe asegurar que el primer contacto sea instantáneo, manteniendo el interés del posible cliente activo y recolectando los datos clave mientras el personal humano se libera para intervenir.
+
+6. Preparación para el Contacto Personalizado de Alto Valor:
+El objetivo no es reemplazar el contacto humano, sino enriquecerlo. La automatización termina exactamente donde comienza la necesidad de una intervención especializada y estratégica. El sistema sirve como el puente perfecto para que, cuando se realice el contacto personal, ya se posea todo el contexto necesario, permitiendo una comunicación mucho más directa, efectiva y profesional desde el primer segundo.

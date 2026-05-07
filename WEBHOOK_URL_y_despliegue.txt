@@ -1,0 +1,68 @@
+WEBHOOK — URL pública HTTPS y token (Meta → Configuración → Webhook)
+
+1) TOKEN DE VERIFICACIÓN (personal y secreto)
+   - Inventa una frase larga (ej. 32+ caracteres, letras y números).
+   - La misma cadena debe ir en:
+     a) Variable de entorno WHATSAPP_VERIFY_TOKEN (en el hosting)
+     b) Campo "Token de verificación" en Meta
+
+2) URL QUE PEGARÁS EN META (Callback URL)
+   Formato:
+     https://TU_SERVICIO_PUBLICO/webhook/whatsapp
+   Ejemplo si despliegas en Render:
+     https://comercial-bautista-webhook.onrender.com/webhook/whatsapp
+
+3) CÓMO OBTENER "TU_SERVICIO_PUBLICO" SIN SERVIDOR PROPIO
+   Opción A — Render (HTTPS gratis, recomendado para empezar)
+   - Cuenta en https://render.com
+   - New → Web Service → conecta este repo o sube la carpeta del proyecto
+   - Build: npm install
+   - Start: npm start
+   - Environment: WHATSAPP_VERIFY_TOKEN = (tu clave secreta)
+   - Al desplegar, copia la URL https://....onrender.com
+
+   Opción B — Prueba local con túnel (URL cambia cada vez en plan gratis de ngrok)
+   - npm install && set WHATSAPP_VERIFY_TOKEN=tu_clave (Windows) o export en Linux/Mac
+   - node server.js
+   - ngrok http 3000 → usa https://xxxx.ngrok-free.app/webhook/whatsapp
+
+4) EN META
+   - URL de devolución de llamada: https://....../webhook/whatsapp
+   - Token de verificación: (el mismo WHATSAPP_VERIFY_TOKEN)
+   - Pulsa "Verificar y guardar"
+   - Suscríbete a los campos del webhook (p. ej. messages) en la misma sección si Meta lo pide
+
+5) TU DOMINIO DE EMPRESA (opcional, más “personal”)
+   - Cuando el webhook funcione en Render (u otro), puedes poner en tu DNS:
+     CNAME api.tuempresa.com → xxx.onrender.com
+   - Entonces en Meta usarías: https://api.tuempresa.com/webhook/whatsapp
+   - El SSL lo gestiona Render o tu proveedor según la doc del hosting.
+
+6b) Mismo objetivo SIN abrir el repo de la web (proyecto WSP IA + Vercel aparte)
+   - Este carpeta puede ser su propio repo GitHub (solo webhook + IA más adelante).
+   - En Vercel: New Project → Import ese repo → Deploy (sin "Root Directory" extra si la raíz es esta carpeta).
+   - Environment Variables: WHATSAPP_VERIFY_TOKEN = (tu clave).
+   - La URL para Meta es la MISMA ruta que con Express:
+       https://TU-DOMINIO-VERCEL.vercel.app/webhook/whatsapp
+     o con dominio propio:
+       https://webhook.comercialbautista.net/webhook/whatsapp
+   - vercel.json reescribe /webhook/whatsapp → función serverless en api/webhook/whatsapp.js
+   - La web bautista-metal-works sigue en su propio proyecto Vercel; solo comparten Namecheap (subdominio distinto).
+
+6) DOMINIO comercialbautista.net (recomendado para este proyecto)
+   - No uses la URL de la web principal sola (https://comercialbautista.net/): ahí no corre el webhook.
+   - Crea un subdominio solo para la API, por ejemplo:
+       webhook.comercialbautista.net
+     o
+       api.comercialbautista.net
+   - Pasos típicos:
+     a) Despliega este proyecto (server.js) en Render u otro PaaS y anota la URL tipo https://TU-SERVICIO.onrender.com
+     b) En el panel de Render: Settings → Custom Domains → añade webhook.comercialbautista.net
+        (Render te dirá el CNAME o registro que debes crear)
+     c) En el DNS donde está comercialbautista.net (registrador o Cloudflare):
+        - Tipo CNAME, nombre "webhook", destino el host que indique Render (ej. TU-SERVICIO.onrender.com)
+        - Espera propagación (minutos u horas)
+     d) Cuando el dominio quede "Verified" en Render, en Meta pega:
+        https://webhook.comercialbautista.net/webhook/whatsapp
+   - Si tu hosting actual ya permite Node.js o Docker en un VPS propio, podrías servir el mismo server.js
+     ahí y apuntar el subdominio a esa IP; en hosting compartido solo PHP suele ser más fácil el subdominio → Render.
