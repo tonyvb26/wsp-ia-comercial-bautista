@@ -4,7 +4,7 @@
  * Variables Vercel:
  *   WHATSAPP_VERIFY_TOKEN, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID
  *   OPENAI_API_KEY, OPENAI_MODEL (opcional)
- *   OPENAI_ASSISTANT_DELAY_FIRST_MS / OPENAI_ASSISTANT_DELAY_NEXT_MS — retrasos en ms (default 0)
+ *   OPENAI_ASSISTANT_DELAY_MS — retraso global por mensaje en ms (default 5000)
  *
  * Meta debe recibir respuesta HTTP 200 rápido. El trabajo pesado va en waitUntil().
  * Plan Hobby (~10 s límite): no uses retrasos largos (10 s + OpenAI suele hacer timeout).
@@ -132,7 +132,15 @@ function extractTextMessages(body) {
       if (!value?.messages) continue;
       for (const msg of value.messages) {
         if (msg.type === "text" && msg.text?.body && msg.from) {
-          out.push({ from: msg.from, body: msg.text.body, id: msg.id });
+          out.push({ from: msg.from, body: msg.text.body, id: msg.id, type: "text" });
+          continue;
+        }
+        if (msg.type === "image" && msg.from) {
+          const caption = msg.image?.caption?.trim();
+          const imageText = caption
+            ? `Imagen referencial enviada. Mensaje del cliente: ${caption}`
+            : "Imagen referencial enviada por el cliente";
+          out.push({ from: msg.from, body: imageText, id: msg.id, type: "image" });
         }
       }
     }
@@ -226,13 +234,9 @@ async function sendTextReply(to, text) {
   console.log("Mensaje enviado OK:", raw);
 }
 
-function getAssistantDelaysMs() {
-  const first = Number(process.env.OPENAI_ASSISTANT_DELAY_FIRST_MS);
-  const next = Number(process.env.OPENAI_ASSISTANT_DELAY_NEXT_MS);
-  return {
-    first: Number.isFinite(first) && first >= 0 ? first : 0,
-    next: Number.isFinite(next) && next >= 0 ? next : 0,
-  };
+function getAssistantDelayMs() {
+  const fixedDelay = Number(process.env.OPENAI_ASSISTANT_DELAY_MS);
+  return Number.isFinite(fixedDelay) && fixedDelay >= 0 ? fixedDelay : 5000;
 }
 
 async function processInbound(body) {
@@ -240,13 +244,12 @@ async function processInbound(body) {
 
   console.log("WhatsApp webhook:", JSON.stringify(body));
   const texts = extractTextMessages(body);
-  const { first: delayFirst, next: delayNext } = getAssistantDelaysMs();
+  const waitMs = getAssistantDelayMs();
 
   for (const { from, body: msgBody, id } of texts) {
     if (markProcessedMessage(id)) continue;
 
     const isFirst = !seenWaId.has(from);
-    const waitMs = isFirst ? delayFirst : delayNext;
     seenWaId.set(from, true);
 
     if (waitMs > 0) await delay(waitMs);
