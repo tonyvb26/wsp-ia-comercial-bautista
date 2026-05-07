@@ -4,12 +4,14 @@
  * Variables Vercel:
  *   WHATSAPP_VERIFY_TOKEN, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID
  *   OPENAI_API_KEY, OPENAI_MODEL (opcional)
- *   OPENAI_ASSISTANT_DELAY_FIRST_MS (opcional, default 10000) — primer mensaje del cliente en esta instancia
- *   OPENAI_ASSISTANT_DELAY_NEXT_MS (opcional, default 5000) — mensajes siguientes
+ *   OPENAI_ASSISTANT_DELAY_FIRST_MS / OPENAI_ASSISTANT_DELAY_NEXT_MS — retrasos en ms (default 0)
  *
- * Nota: los retrasos suman tiempo antes de responder al webhook; en plan Hobby de Vercel el
- * tiempo máximo de función puede ser bajo: si ves timeouts, baja los valores o sube maxDuration (Pro).
+ * Meta debe recibir respuesta HTTP 200 rápido. El trabajo pesado va en waitUntil().
+ * Plan Hobby (~10 s límite): no uses retrasos largos (10 s + OpenAI suele hacer timeout).
+ * Para 10000/5000 ms usa Vercel Pro + maxDuration alto y define las variables de entorno.
  */
+
+const { waitUntil } = require("@vercel/functions");
 
 const GRAPH_VERSION = "v21.0";
 const WHATSAPP_TEXT_MAX = 4000;
@@ -149,9 +151,31 @@ function getAssistantDelaysMs() {
   const first = Number(process.env.OPENAI_ASSISTANT_DELAY_FIRST_MS);
   const next = Number(process.env.OPENAI_ASSISTANT_DELAY_NEXT_MS);
   return {
-    first: Number.isFinite(first) && first >= 0 ? first : 10000,
-    next: Number.isFinite(next) && next >= 0 ? next : 5000,
+    first: Number.isFinite(first) && first >= 0 ? first : 0,
+    next: Number.isFinite(next) && next >= 0 ? next : 0,
   };
+}
+
+async function processInbound(body) {
+  if (!body || typeof body !== "object") return;
+
+  console.log("WhatsApp webhook:", JSON.stringify(body));
+  const texts = extractTextMessages(body);
+  const { first: delayFirst, next: delayNext } = getAssistantDelaysMs();
+
+  for (const { from, body: msgBody } of texts) {
+    const isFirst = !seenWaId.has(from);
+    const waitMs = isFirst ? delayFirst : delayNext;
+    seenWaId.set(from, true);
+
+    if (waitMs > 0) await delay(waitMs);
+
+    let reply = await generateAssistantReply(msgBody);
+    if (!reply) {
+      reply = "Gracias por escribirnos. Ya vimos tu mensaje y en breve te seguimos por aquí.";
+    }
+    await sendTextReply(from, reply);
+  }
 }
 
 module.exports = async function handler(req, res) {
@@ -181,30 +205,13 @@ module.exports = async function handler(req, res) {
   }
 
   if (req.method === "POST") {
-    try {
-      if (req.body && typeof req.body === "object") {
-        console.log("WhatsApp webhook:", JSON.stringify(req.body));
-        const texts = extractTextMessages(req.body);
-        const { first: delayFirst, next: delayNext } = getAssistantDelaysMs();
+    const snapshot = req.body && typeof req.body === "object" ? req.body : null;
 
-        for (const { from, body } of texts) {
-          const isFirst = !seenWaId.has(from);
-          const waitMs = isFirst ? delayFirst : delayNext;
-          seenWaId.set(from, true);
-
-          if (waitMs > 0) await delay(waitMs);
-
-          let reply = await generateAssistantReply(body);
-          if (!reply) {
-            reply =
-              "Gracias por escribirnos. Ya vimos tu mensaje y en breve te seguimos por aquí.";
-          }
-          await sendTextReply(from, reply);
-        }
-      }
-    } catch (e) {
-      console.error("Webhook POST error:", e);
-    }
+    waitUntil(
+      processInbound(snapshot).catch((e) => {
+        console.error("Webhook async process error:", e);
+      })
+    );
 
     res.writeHead(200);
     res.end();
