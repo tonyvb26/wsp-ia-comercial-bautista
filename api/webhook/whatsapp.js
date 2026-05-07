@@ -15,9 +15,11 @@ const { waitUntil } = require("@vercel/functions");
 
 const GRAPH_VERSION = "v21.0";
 const WHATSAPP_TEXT_MAX = 4000;
+const MAX_HISTORY_TURNS = 12;
 
 /** Memoria efímera por instancia serverless (reinicios = se trata de nuevo como “primer mensaje”). */
 const seenWaId = new Map();
+const conversationByWaId = new Map();
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -55,6 +57,32 @@ Cuando tengas los datos suficientes para iniciar una cotización formal, explica
 
 Si el cliente solo saluda o da poca información, guiá con una o dos preguntas abiertas y cálidas para avanzar.`;
 
+function getConversationHistory(waId) {
+  const history = conversationByWaId.get(waId);
+  return Array.isArray(history) ? history : [];
+}
+
+function appendConversationTurn(waId, role, content) {
+  const history = getConversationHistory(waId);
+  history.push({ role, content });
+  if (history.length > MAX_HISTORY_TURNS) {
+    history.splice(0, history.length - MAX_HISTORY_TURNS);
+  }
+  conversationByWaId.set(waId, history);
+}
+
+function normalizeAssistantReply(text) {
+  if (!text) return text;
+  let out = text.trim();
+  out = out.replace(/[¿¡]/g, "");
+  out = out.replace(/["']/g, "");
+  out = out.replace(/\s+\n/g, "\n");
+
+  // Fuerza primera palabra en mayúscula.
+  out = out.replace(/^\s*([a-záéíóúñ])/i, (m, c) => m.replace(c, c.toUpperCase()));
+  return out.slice(0, WHATSAPP_TEXT_MAX);
+}
+
 function extractTextMessages(body) {
   const out = [];
   if (!body?.entry) return out;
@@ -72,11 +100,15 @@ function extractTextMessages(body) {
   return out;
 }
 
-async function generateAssistantReply(userText) {
+async function generateAssistantReply(waId, userText, isFirst) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
 
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const history = getConversationHistory(waId);
+  const behaviorPrompt = isFirst
+    ? "Este es el primer mensaje del cliente en la conversación actual: presentate como Gladis solo en esta respuesta."
+    : "NO te vuelvas a presentar. Ya te presentaste antes. Continúa la conversación sin reiniciar.";
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -90,6 +122,13 @@ async function generateAssistantReply(userText) {
       max_tokens: 700,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
+        {
+          role: "system",
+          content:
+            `${behaviorPrompt} No repitas preguntas si el cliente ya dio ese dato. ` +
+            "Antes de preguntar, revisa el historial y pide solo el siguiente dato faltante.",
+        },
+        ...history,
         { role: "user", content: userText },
       ],
     }),
@@ -111,7 +150,7 @@ async function generateAssistantReply(userText) {
 
   const text = data.choices?.[0]?.message?.content?.trim();
   if (!text) return null;
-  return text.slice(0, WHATSAPP_TEXT_MAX);
+  return normalizeAssistantReply(text);
 }
 
 async function sendTextReply(to, text) {
@@ -170,10 +209,12 @@ async function processInbound(body) {
 
     if (waitMs > 0) await delay(waitMs);
 
-    let reply = await generateAssistantReply(msgBody);
+    let reply = await generateAssistantReply(from, msgBody, isFirst);
     if (!reply) {
       reply = "Gracias por escribirnos. Ya vimos tu mensaje y en breve te seguimos por aquí.";
     }
+    appendConversationTurn(from, "user", msgBody);
+    appendConversationTurn(from, "assistant", reply);
     await sendTextReply(from, reply);
   }
 }
