@@ -130,16 +130,43 @@ function isConfirmMessage(text) {
   return /\bCONFIRMO\b/.test(text || "");
 }
 
-function hasEnoughInfoForSpecConfirmation(waId) {
+function getClientDataSignals(waId) {
   const blob = getFlattenedUserText(waId).toLowerCase();
-  const hasProduct = /(techo|reja|baranda|port[oó]n|puerta|ventana|estructura|mueble|afiche|gr[úu]a|trabajo|producto)/i.test(
+  const hasProduct = /(techo|reja|baranda|port[oó]n|puerta|ventana|estructura|mueble|afiche|gr[úu]a|trabajo|producto|cerco)/i.test(
     blob
   );
-  const hasTech = /(metro|medida|alto|ancho|material|acabado|pintura|unidad|cantidad|imagen referencial)/i.test(blob);
+  const hasTech = /(metro|medida|alto|ancho|material|acabado|pintura|imagen referencial|m2|m²)/i.test(blob);
   const hasScope = /(hogar|dom[eé]stic|industrial|empresa)/i.test(blob);
   const hasId = /(ruc|mi nombre es|nombre completo|soy [a-záéíóúñ])/i.test(blob);
   const hasAddress = /(direcci[oó]n|ubicaci[oó]n|avenida|av\.|jr\.|calle|sector|referencia|cerca de|lugar)/i.test(blob);
-  return hasProduct && hasTech && hasScope && hasId && hasAddress;
+  return { blob, hasProduct, hasTech, hasScope, hasId, hasAddress };
+}
+
+function hasLogicalQuantity(waId) {
+  const { blob } = getClientDataSignals(waId);
+  const isAreaWork = /(techo|techado|techar|cerco|cercado|cercar)/i.test(blob);
+  if (isAreaWork) {
+    return /(área|area|m2|m²|metros cuadrados|sector|sectores|tramo|tramos|frente|perímetro|perimetro)/i.test(blob);
+  }
+  return /(unidad|unidades|cantidad|pieza|piezas|paño|paños|hoja|hojas|juego|juegos)/i.test(blob);
+}
+
+function getLogicalQuantityQuestion(waId) {
+  const { blob, hasProduct, hasTech } = getClientDataSignals(waId);
+  if (!hasProduct || !hasTech || hasLogicalQuantity(waId)) return null;
+  if (/(techo|techado|techar)/i.test(blob)) {
+    return "Muy bien, para completar la cotización, cuántas áreas techadas necesitas que fabriquemos o instalemos?";
+  }
+  if (/(cerco|cercado|cercar)/i.test(blob)) {
+    return "Muy bien, para completar la cotización, cuántas áreas cercadas o tramos de cerco necesitas?";
+  }
+  return "Muy bien, para completar la cotización, qué cantidad necesitas exactamente (unidades, piezas o paños según el trabajo)?";
+}
+
+function hasEnoughInfoForSpecConfirmation(waId) {
+  const { hasProduct, hasTech, hasScope, hasId, hasAddress } = getClientDataSignals(waId);
+  const hasQty = hasLogicalQuantity(waId);
+  return hasProduct && hasTech && hasScope && hasId && hasAddress && hasQty;
 }
 
 function decorateReply(reply, { isFirst, shouldClose }) {
@@ -374,6 +401,15 @@ async function processInbound(body) {
     }
 
     appendConversationTurn(from, "user", msgBody);
+
+    // Pregunta lógica de cantidad según el tipo de trabajo antes de cerrar/resumir.
+    const qtyQuestion = getLogicalQuantityQuestion(from);
+    if (qtyQuestion) {
+      const decoratedQty = decorateReply(qtyQuestion, { isFirst, shouldClose: false });
+      appendConversationTurn(from, "assistant", decoratedQty);
+      await sendTextReply(from, decoratedQty);
+      continue;
+    }
 
     // Si ya hay información suficiente, primero pedimos confirmación formal del resumen.
     if (hasEnoughInfoForSpecConfirmation(from)) {
