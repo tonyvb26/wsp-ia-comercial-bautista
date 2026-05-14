@@ -10,7 +10,7 @@
  *   OPENAI_API_KEY              API key de OpenAI
  *   OPENAI_MODEL                Opcional, default gpt-4o-mini
  *   OPENAI_VISION_MODEL         Opcional, default = OPENAI_MODEL
- *   LEAD_FORWARD_TO             Opcional, número (solo dígitos) para reenviar leads
+ *   LEAD_FORWARD_TO             Opcional, números extra para reenviar leads (separados por coma)
  *
  *   UPSTASH_REDIS_REST_URL      Opcional, fuertemente recomendado (persistir sesión)
  *   UPSTASH_REDIS_REST_TOKEN    Opcional, fuertemente recomendado (persistir sesión)
@@ -831,7 +831,7 @@ function firstName(full) {
   return parts[0] || null;
 }
 
-function summaryText(session, contactNumber) {
+function buildSummaryLines(session, contactNumber, { includeConfirmationLine }) {
   const f = session.fields;
   const nombreCorto = firstName(f.nombre) || firstName(session.profileName) || "No especificado";
   const rucONombre = f.ruc ? `RUC ${f.ruc}` : f.nombre || "No especificado";
@@ -847,10 +847,22 @@ function summaryText(session, contactNumber) {
     `4) Trabajo doméstico/industrial: ${f.ambito || "No especificado"}`,
     `5) Ubicación/referencia: ${f.ubicacion || "No especificado"}`,
     `6) RUC/Nombre: ${rucONombre}`,
-    "",
-    'Si todo está correcto, escribe "confirmo" para que procedamos con la cotización formal. Si deseas modificar algún punto, indícame el número (1 a 6) y el nuevo dato.',
   ];
+  if (includeConfirmationLine) {
+    lines.push(
+      "",
+      'Si todo está correcto, escribe "confirmo" para que procedamos con la cotización formal. Si deseas modificar algún punto, indícame el número (1 a 6) y el nuevo dato.'
+    );
+  }
   return lines.join("\n");
+}
+
+function summaryText(session, contactNumber) {
+  return buildSummaryLines(session, contactNumber, { includeConfirmationLine: true });
+}
+
+function summaryForForwardText(session, contactNumber) {
+  return buildSummaryLines(session, contactNumber, { includeConfirmationLine: false });
 }
 
 function resolveFieldFromText(text) {
@@ -1001,13 +1013,36 @@ function extractInbound(body) {
   return out;
 }
 
-async function forwardLead(text, customerFrom) {
-  const dest = (process.env.LEAD_FORWARD_TO || "").replace(/\D/g, "");
-  if (!dest) return;
-  const header = customerFrom
-    ? `📋 Nuevo lead capturado por Gladis\nCliente: ${formatPhone(customerFrom)}\n`
-    : "📋 Nuevo lead capturado por Gladis\n";
-  await sendText(dest, `${header}\n${text}`);
+function getLeadRecipients() {
+  const defaults = ["972324798", "971193243"];
+  const extra = String(process.env.LEAD_FORWARD_TO || "")
+    .split(/[,;\s]+/)
+    .map((x) => x.replace(/\D/g, ""))
+    .filter(Boolean);
+  return [...new Set([...defaults, ...extra])];
+}
+
+async function forwardLead(session, customerFrom) {
+  const recipients = getLeadRecipients();
+  if (!recipients.length) return;
+
+  const intro =
+    "Hola Yojan 🙋🏻‍♀️ Un nuevo Cliente se ha comunicado con nosotros y estos son las especificaciones del proyecto 📝, comunícate con él enviándole la cotización a la brevedad posible o para hacer alguna consulta adicional, que tengas un buen día 🙂";
+  const summary = summaryForForwardText(session, customerFrom);
+
+  let forwardImageId = null;
+  if (session.images.length) {
+    const last = session.images[session.images.length - 1];
+    forwardImageId = await reuploadImageForOurNumber(last.mediaId);
+  }
+
+  for (const to of recipients) {
+    await sendText(to, intro);
+    if (forwardImageId) {
+      await sendImage(to, forwardImageId);
+    }
+    await sendText(to, summary);
+  }
 }
 
 // ============================================================================
@@ -1450,7 +1485,7 @@ async function stepResumenConfirmar(session, from, userText, cls) {
   ) {
     await sendText(from, farewellMessage());
     try {
-      await forwardLead(summaryText(session, from), from);
+      await forwardLead(session, from);
     } catch (e) {
       console.error("forwardLead error:", e);
     }
