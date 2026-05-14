@@ -241,6 +241,14 @@ async function sendText(to, text) {
     console.error("WhatsApp text send error", { to, status: r.status, body: errBody });
     return false;
   }
+  const data = await r.json().catch(() => ({}));
+  console.log(
+    "[whatsappSendText] " +
+      JSON.stringify({
+        to,
+        message_id: data.messages?.[0]?.id || null,
+      })
+  );
   return true;
 }
 
@@ -267,6 +275,14 @@ async function sendImage(to, mediaId) {
     console.error("WhatsApp image send error", { to, status: r.status, body: errBody });
     return false;
   }
+  const data = await r.json().catch(() => ({}));
+  console.log(
+    "[whatsappSendImage] " +
+      JSON.stringify({
+        to,
+        message_id: data.messages?.[0]?.id || null,
+      })
+  );
   return true;
 }
 
@@ -1083,6 +1099,29 @@ function extractInbound(body) {
   return out;
 }
 
+function logWhatsAppStatuses(body) {
+  if (!body?.entry) return;
+  for (const entry of body.entry) {
+    for (const change of entry.changes || []) {
+      const statuses = change.value?.statuses || [];
+      for (const s of statuses) {
+        console.log(
+          "[whatsappStatus] " +
+            JSON.stringify({
+              id: s.id,
+              status: s.status,
+              recipient_id: s.recipient_id,
+              timestamp: s.timestamp,
+              conversation: s.conversation?.id || null,
+              pricing: s.pricing || null,
+              errors: s.errors || null,
+            })
+        );
+      }
+    }
+  }
+}
+
 function getLeadRecipients() {
   const defaults = ["972324798", "971193243"];
   const extra = String(process.env.LEAD_FORWARD_TO || "")
@@ -1845,6 +1884,7 @@ function applyFieldUpdate(session, field, val) {
 
 async function processInbound(body) {
   if (!body || typeof body !== "object") return;
+  logWhatsAppStatuses(body);
   const items = extractInbound(body);
   for (const msg of items) {
     if (!msg.from) continue;
