@@ -30,7 +30,8 @@ const COMPANY_FB_URL = "https://www.facebook.com/people/Metaltec-Comercial-Bauti
 const ASSISTANT_NAME = "Gladis";
 
 const ABUSE_COOLDOWN_MS = 60 * 60 * 1000; // 1h bloqueo silencioso por abuso
-const CLOSED_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2h tras cierre, no reinicia
+const CLOSED_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2h tras cierre: acuse breve si insiste
+const CLOSED_AUTO_REOPEN_MS = 15 * 60 * 1000; // pasados 15 min desde el cierre, cualquier mensaje reabre
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 const CLOSED_ACK_COOLDOWN_MS = 30 * 60 * 1000; // acuse "ya en proceso" cada 30min
 
@@ -449,6 +450,19 @@ function isInitialGreetingOnly(text) {
   return /^(hola|buenas|buenos d[ií]as|buenas tardes|buenas noches|hey|holi|saludos|alo|alguien|est[áa]n? atendiendo|atienden)\b[\s,.!?¿¡]*$/i.test(
     t.replace(/\s+/g, " ")
   );
+}
+
+// El cliente pide explícitamente otra cotización tras haber cerrado una.
+function looksLikeNewQuoteRequest(text) {
+  if (!text) return false;
+  return /\b(otra|nueva|otro|nuevo|m[áa]s|adicional|adicionalmente|tambi[ée]n)\s+(cotizaci[oó]n(?:es)?|consulta|trabajo|cotizar|pedido|proyecto|servicio|requerimiento)\b/i.test(
+    text
+  )
+    || /\b(necesito|quiero|quer[ií]a|tengo|deseo|requiero)\s+(otra|otro|m[áa]s|cotizar|una?\s+cotizaci[oó]n|un\s+presupuesto|otra\s+consulta)\b/i.test(
+      text
+    )
+    || /\b(pedir|hacer|solicitar|consultar)\s+(otra|otro|m[áa]s|una?\s+nueva?)\b/i.test(text)
+    || /\b(cotizar|cotizame|cot[ií]zame)\s+otro\b/i.test(text);
 }
 
 // ============================================================================
@@ -1050,19 +1064,45 @@ async function handleMessage(session, msg) {
   // Bloqueo silencioso por abuso (no respondemos nada).
   if (session.blockedUntil && session.blockedUntil > now) return;
 
-  // Conversación cerrada formalmente: acuse breve sin reabrir el flujo.
+  // Conversación cerrada formalmente: acuse breve o reapertura si pide nueva cotización.
   if (session.step === "cerrado") {
-    if (session.closedUntil && session.closedUntil > now) {
+    const incomingText = (msg.text || msg.caption || "").trim();
+    const closedSince = session.closedUntil
+      ? now - (session.closedUntil - CLOSED_COOLDOWN_MS)
+      : Number.POSITIVE_INFINITY;
+
+    const explicitNew = msg.type === "image" || looksLikeNewQuoteRequest(incomingText);
+    const looksLikeNewSession = isInitialGreetingOnly(incomingText);
+    const enoughTimePassed = closedSince >= CLOSED_AUTO_REOPEN_MS;
+    const cooldownExpired = !session.closedUntil || session.closedUntil <= now;
+
+    const wantsReopen = explicitNew || looksLikeNewSession || enoughTimePassed || cooldownExpired;
+
+    if (!wantsReopen) {
       if (!session.closedAckAt || now - session.closedAckAt > CLOSED_ACK_COOLDOWN_MS) {
         await sendText(from, closedAckMessage());
         session.closedAckAt = now;
       }
       return;
     }
-    // Cooldown expirado: reiniciar como nueva conversación.
+
+    // Reiniciar la sesión como una nueva conversación.
     const fresh = newSession();
     fresh.profileName = session.profileName;
     Object.assign(session, fresh);
+
+    if (explicitNew && msg.type !== "image") {
+      // Reapertura breve: ya conocemos al cliente, no repetimos el saludo completo.
+      session.step = "tipo_trabajo";
+      await sendText(
+        from,
+        "Con gusto te ayudo con una nueva cotización. Cuéntame por favor qué tipo de trabajo deseas construir o fabricar (por ejemplo: portón metálico, escalera, baranda, ventana, estructura)."
+      );
+      return;
+    }
+    // En el resto de casos (saludo, imagen, tiempo extenso) caemos al flujo normal:
+    // - Imagen: el bloque de imágenes de abajo se encarga.
+    // - Saludo/silencio prolongado: el bloque de saludo inicial enviará el greeting completo.
   }
 
   // === Imagen entrante ===
