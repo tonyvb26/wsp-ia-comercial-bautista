@@ -12,8 +12,11 @@
  *   OPENAI_VISION_MODEL         Opcional, default = OPENAI_MODEL
  *   LEAD_FORWARD_TO             Opcional, número (solo dígitos) para reenviar leads
  *
- * Nota: el estado vive en memoria del runtime serverless. En cold start
- * se pierde y la conversación se reinicia (no es problema para el flujo).
+ *   UPSTASH_REDIS_REST_URL      Opcional, fuertemente recomendado (persistir sesión)
+ *   UPSTASH_REDIS_REST_TOKEN    Opcional, fuertemente recomendado (persistir sesión)
+ *
+ * Sin Upstash el estado vive solo en memoria del runtime y se pierde
+ * entre invocaciones serverless: Gladis vuelve a saludar y vuelve a empezar.
  */
 
 const { waitUntil } = require("@vercel/functions");
@@ -26,18 +29,81 @@ const COMPANY_WEB_URL = "https://comercialbautista.net/";
 const COMPANY_FB_URL = "https://www.facebook.com/people/Metaltec-Comercial-Bautista/61588330106602/";
 const ASSISTANT_NAME = "Gladis";
 
-const COOLDOWN_MS = 60 * 60 * 1000;
+const ABUSE_COOLDOWN_MS = 60 * 60 * 1000; // 1h bloqueo silencioso por abuso
+const CLOSED_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2h tras cierre, no reinicia
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const CLOSED_ACK_COOLDOWN_MS = 30 * 60 * 1000; // acuse "ya en proceso" cada 30min
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || OPENAI_MODEL;
 
+const LINEAR_STEPS = [
+  "tipo_trabajo",
+  "material",
+  "medidas",
+  "ambito",
+  "ubicacion_pedir",
+  "identificacion_ruc",
+];
+
 // ============================================================================
-// Estado en memoria
+// Upstash Redis (REST) — persistencia opcional
 // ============================================================================
 
-const sessions = new Map();
-const processedMessageIds = new Map();
+function kvEnabled() {
+  return Boolean(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
+}
+
+async function kvPipeline(commands) {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+  try {
+    const r = await fetch(`${url}/pipeline`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(commands),
+    });
+    if (!r.ok) {
+      console.error("Upstash pipeline error", r.status, await r.text());
+      return null;
+    }
+    return await r.json();
+  } catch (e) {
+    console.error("Upstash exception", e);
+    return null;
+  }
+}
+
+async function kvGetJSON(key) {
+  const out = await kvPipeline([["GET", key]]);
+  const val = out?.[0]?.result;
+  if (val == null) return null;
+  try {
+    return JSON.parse(val);
+  } catch {
+    return null;
+  }
+}
+
+async function kvSetJSON(key, value, ttlSeconds) {
+  await kvPipeline([["SET", key, JSON.stringify(value), "EX", String(ttlSeconds)]]);
+}
+
+async function kvSetIfNew(key, ttlSeconds) {
+  const out = await kvPipeline([["SET", key, "1", "NX", "EX", String(ttlSeconds)]]);
+  return out?.[0]?.result === "OK";
+}
+
+// ============================================================================
+// Estado de sesión (memoria + Upstash si está disponible)
+// ============================================================================
+
+const sessionsMem = new Map();
+const processedIdsMem = new Map();
 
 function newSession() {
   return {
@@ -57,41 +123,70 @@ function newSession() {
     modifyingField: null,
     warnings: 0,
     blockedUntil: 0,
-    closed: false,
+    closedUntil: 0,
+    closedAckAt: 0,
     profileName: null,
     lastActivity: Date.now(),
   };
 }
 
-function getSession(waId) {
-  let s = sessions.get(waId);
+async function loadSession(waId) {
+  if (kvEnabled()) {
+    const stored = await kvGetJSON(`gladis:session:${waId}`);
+    if (stored && typeof stored === "object") {
+      // Asegurar campos nuevos (compat hacia atrás)
+      const merged = Object.assign(newSession(), stored);
+      merged.fields = Object.assign(newSession().fields, stored.fields || {});
+      merged.lastActivity = Date.now();
+      return merged;
+    }
+    return newSession();
+  }
+  let s = sessionsMem.get(waId);
   if (s && Date.now() - s.lastActivity > SESSION_TTL_MS) {
-    sessions.delete(waId);
+    sessionsMem.delete(waId);
     s = null;
   }
   if (!s) {
     s = newSession();
-    sessions.set(waId, s);
+    sessionsMem.set(waId, s);
   }
   s.lastActivity = Date.now();
   return s;
 }
 
-function isAlreadyProcessed(messageId) {
+async function saveSession(waId, session) {
+  session.lastActivity = Date.now();
+  if (kvEnabled()) {
+    try {
+      await kvSetJSON(`gladis:session:${waId}`, session, Math.floor(SESSION_TTL_MS / 1000));
+    } catch (e) {
+      console.error("saveSession error:", e);
+    }
+    return;
+  }
+  sessionsMem.set(waId, session);
+}
+
+async function markSeen(messageId) {
   if (!messageId) return false;
+  if (kvEnabled()) {
+    const isNew = await kvSetIfNew(`gladis:seen:${messageId}`, 3600);
+    return !isNew;
+  }
   const now = Date.now();
-  if (processedMessageIds.has(messageId)) return true;
-  processedMessageIds.set(messageId, now);
-  if (processedMessageIds.size > 5000) {
-    for (const [k, t] of processedMessageIds) {
-      if (now - t > 60 * 60 * 1000) processedMessageIds.delete(k);
+  if (processedIdsMem.has(messageId)) return true;
+  processedIdsMem.set(messageId, now);
+  if (processedIdsMem.size > 5000) {
+    for (const [k, t] of processedIdsMem) {
+      if (now - t > 60 * 60 * 1000) processedIdsMem.delete(k);
     }
   }
   return false;
 }
 
 // ============================================================================
-// Graph API helpers
+// Graph API
 // ============================================================================
 
 async function graphGet(path, accessToken) {
@@ -137,8 +232,7 @@ async function sendText(to, text) {
     }),
   });
   if (!r.ok) {
-    const raw = await r.text();
-    console.error("WhatsApp text send error", r.status, raw);
+    console.error("WhatsApp text send error", r.status, await r.text());
   }
 }
 
@@ -161,8 +255,7 @@ async function sendImage(to, mediaId) {
     }),
   });
   if (!r.ok) {
-    const raw = await r.text();
-    console.error("WhatsApp image send error", r.status, raw);
+    console.error("WhatsApp image send error", r.status, await r.text());
   }
 }
 
@@ -208,35 +301,34 @@ async function reuploadImageForOurNumber(mediaId) {
 }
 
 // ============================================================================
-// OpenAI helpers
+// OpenAI
 // ============================================================================
 
 async function openaiJSON(messages, { model = OPENAI_MODEL, temperature = 0.2 } = {}) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json; charset=utf-8",
-    },
-    body: JSON.stringify({
-      model,
-      temperature,
-      response_format: { type: "json_object" },
-      messages,
-    }),
-  });
-  if (!r.ok) {
-    const raw = await r.text();
-    console.error("OpenAI JSON error", r.status, raw);
-    return null;
-  }
-  const data = await r.json().catch(() => null);
-  if (!data) return null;
   try {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({
+        model,
+        temperature,
+        response_format: { type: "json_object" },
+        messages,
+      }),
+    });
+    if (!r.ok) {
+      console.error("OpenAI JSON error", r.status, await r.text());
+      return null;
+    }
+    const data = await r.json();
     return JSON.parse(data.choices?.[0]?.message?.content || "{}");
-  } catch {
+  } catch (e) {
+    console.error("OpenAI JSON exception", e);
     return null;
   }
 }
@@ -245,52 +337,51 @@ async function analyzeImage(buffer, mimeType) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
   const dataUri = `data:${mimeType};base64,${buffer.toString("base64")}`;
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json; charset=utf-8",
-    },
-    body: JSON.stringify({
-      model: OPENAI_VISION_MODEL,
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content:
-            "Eres un asistente que describe imágenes referenciales para cotizaciones de carpintería metálica, herrería o fabricación industrial. Responde SOLO un JSON válido.",
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text:
-                "Analiza la imagen y devuelve JSON con las claves: tipo_trabajo (string), material (string), acabado (string), medidas_aproximadas (string), descripcion (string breve). Si un campo no puede deducirse, usa 'no claro'.",
-            },
-            { type: "image_url", image_url: { url: dataUri } },
-          ],
-        },
-      ],
-    }),
-  });
-  if (!r.ok) {
-    const raw = await r.text();
-    console.error("OpenAI vision error", r.status, raw);
-    return null;
-  }
-  const data = await r.json().catch(() => null);
-  if (!data) return null;
   try {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({
+        model: OPENAI_VISION_MODEL,
+        temperature: 0.2,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "Eres un asistente que describe imágenes referenciales para cotizaciones de carpintería metálica, herrería o fabricación industrial. Responde SOLO un JSON válido.",
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text:
+                  "Analiza la imagen y devuelve JSON con las claves: tipo_trabajo (string), material (string), acabado (string), medidas_aproximadas (string), descripcion (string breve). Si un campo no se puede deducir, usa 'no claro'.",
+              },
+              { type: "image_url", image_url: { url: dataUri } },
+            ],
+          },
+        ],
+      }),
+    });
+    if (!r.ok) {
+      console.error("OpenAI vision error", r.status, await r.text());
+      return null;
+    }
+    const data = await r.json();
     return JSON.parse(data.choices?.[0]?.message?.content || "{}");
-  } catch {
+  } catch (e) {
+    console.error("OpenAI vision exception", e);
     return null;
   }
 }
 
 // ============================================================================
-// Detección local (fallback) de groserías y confirmaciones
+// Detectores locales
 // ============================================================================
 
 const PROFANITY = [
@@ -327,7 +418,7 @@ function looksLikeProfanity(text) {
 
 function looksLikeConfirm(text) {
   if (!text) return false;
-  return /\b(si|sí|claro|correcto|exacto|de acuerdo|dale|ok|okay|listo|perfecto|confirmo|confirmado|así es|asi es)\b/i.test(
+  return /\b(s[ií]|claro|correcto|exacto|de acuerdo|dale|ok|okay|listo|perfecto|confirmo|confirmado|as[íi] es)\b/i.test(
     text
   );
 }
@@ -339,9 +430,86 @@ function looksLikeDeny(text) {
 
 function looksLikeRefuseAddress(text) {
   if (!text) return false;
-  return /\b(no (te|le) puedo dar|no (quiero|deseo|puedo) (dar|compartir|brindar)|prefiero no|privad[oa]|reserva|no compartir)\b.*\b(direcci|ubicac|domicilio)?/i.test(
+  return /\b(no (te|le) (puedo|quiero) dar|no (quiero|deseo|puedo) (dar|compartir|brindar)|prefiero no|privad[oa]|no compartir)\b/i.test(
     text
   );
+}
+
+function isPushback(text) {
+  if (!text) return false;
+  return /\b(ya (te |le |se )?(lo |la |los |las )?(?:di|dije|mencion[ée]|indiqu[ée]|inform[ée]|envi[ée]|mand[ée])|te lo (acabo de |ya )?(?:di|dije|mencion[ée])|ya lo (?:di|dije|mencion[ée])|repet[ií]s|me preguntas lo mismo|no me (?:entiendes|escuchas))\b/i.test(
+    text
+  );
+}
+
+function isInitialGreetingOnly(text) {
+  const t = (text || "").trim().toLowerCase();
+  if (!t) return true;
+  return /^(hola|buenas|buenos d[ií]as|buenas tardes|buenas noches|hey|holi|saludos|alo|alguien|est[áa]n? atendiendo|atienden)\b[\s,.!?¿¡]*$/i.test(
+    t.replace(/\s+/g, " ")
+  );
+}
+
+// ============================================================================
+// Validadores
+// ============================================================================
+
+const FILLER_WORDS = [
+  "si",
+  "sí",
+  "no",
+  "ok",
+  "okay",
+  "listo",
+  "perfecto",
+  "correcto",
+  "claro",
+  "dale",
+  "ya",
+  "confirmo",
+  "gracias",
+  "exacto",
+  "asi",
+  "así",
+  "bien",
+];
+
+function normalizeWord(s) {
+  return String(s || "").trim().toLowerCase();
+}
+
+function isValidTipoTrabajo(val) {
+  if (!val) return false;
+  const t = normalizeWord(val);
+  if (t.length < 4) return false;
+  if (FILLER_WORDS.includes(t)) return false;
+  if (/^\d+$/.test(t)) return false;
+  return true;
+}
+
+function isValidMaterial(val, tipoTrabajo) {
+  if (!val) return false;
+  const v = normalizeWord(val);
+  if (v.length < 4) return false;
+  if (FILLER_WORDS.includes(v)) return false;
+  if (tipoTrabajo) {
+    const t = normalizeWord(tipoTrabajo);
+    if (v.split(/\s+/).length === 1 && t.includes(v)) return false;
+    if (v === "metal" || v === "metálico" || v === "metalico") return false;
+  }
+  return true;
+}
+
+function isValidName(val) {
+  if (!val) return false;
+  const v = String(val).trim();
+  if (v.length < 3) return false;
+  const low = v.toLowerCase();
+  if (FILLER_WORDS.includes(low)) return false;
+  if (isPushback(v)) return false;
+  if (/^\d+$/.test(v)) return false;
+  if (low.startsWith("ya te") || low.startsWith("ya lo")) return false;
+  return true;
 }
 
 // ============================================================================
@@ -351,7 +519,7 @@ function looksLikeRefuseAddress(text) {
 function describeStep(step) {
   switch (step) {
     case "saludo":
-      return "todavía no se inicia, esperar primer mensaje del cliente";
+      return "todavía no se inicia, esperar primer mensaje";
     case "tipo_trabajo":
       return "preguntar qué desea construir o fabricar";
     case "material":
@@ -388,13 +556,12 @@ async function classify(session, userText) {
       role: "system",
       content: `Eres un clasificador para Gladis, asistente comercial de ${COMPANY_BRAND}.
 Recibes: paso actual del flujo de cotización, datos ya recopilados y el mensaje del cliente.
-Devuelves SOLO un JSON con esta forma:
+Devuelves SOLO un JSON con esta forma exacta:
 {
-  "intent": "answer" | "out_of_order" | "off_topic" | "abuse" | "modify" | "confirm" | "deny" | "refuse_address" | "no_idea_material" | "approximate_size",
+  "intent": "answer" | "out_of_order" | "off_topic" | "abuse" | "modify" | "confirm" | "deny" | "refuse_address" | "no_idea_material" | "approximate_size" | "pushback",
   "value_for_current_step": string | null,
   "captured_for_other_steps": {
     "tipo_trabajo": string | null,
-    "material": string | null,
     "medidas": string | null,
     "ambito": "domestico" | "industrial" | null,
     "ubicacion": string | null,
@@ -407,7 +574,7 @@ Devuelves SOLO un JSON con esta forma:
 Definiciones:
 - "answer": responde directamente lo pedido en el paso actual.
 - "out_of_order": da datos que pertenecen a otro paso distinto al actual, sin contestar el actual.
-- "off_topic": se desvía del tema (clima, política, vida personal, charla informal, etc.).
+- "off_topic": se desvía del tema (clima, política, vida personal, charla informal).
 - "abuse": insultos, groserías, lenguaje sexual o amenazas.
 - "modify": pide cambiar/corregir algo del resumen ya mostrado.
 - "confirm": responde sí/correcto/ok/confirmo a una pregunta cerrada de confirmación.
@@ -415,13 +582,17 @@ Definiciones:
 - "refuse_address": en el paso de ubicación dice que no quiere o no puede dar la dirección.
 - "no_idea_material": en el paso de material dice no sé / no tengo idea / no conozco materiales.
 - "approximate_size": en medidas indica que son aproximados / no exactos / cálculo grueso.
+- "pushback": dice que ya entregó la información (ej. "ya te lo di", "te lo acabo de decir", "ya lo mencioné").
 
-Reglas:
-- "value_for_current_step" debe ser una versión limpia y breve de la respuesta para el paso actual, o null.
-- En "captured_for_other_steps" incluye SOLO valores que estén claramente expresados en el mensaje del cliente; no inventes.
-- ambito: "domestico" si dice casa, hogar, familia, personal, vivienda. "industrial" si dice empresa, negocio, industria, fábrica, RUC, comercial.
+Reglas estrictas:
+- "value_for_current_step" debe ser una versión limpia y breve de la respuesta para el paso actual, o null si no aplica.
+- En "captured_for_other_steps" incluye SOLO valores claramente expresados en este mensaje. NO inventes.
+- NUNCA extraigas "material" en captured_for_other_steps: el material se debe preguntar siempre en su paso (no incluyas la clave material en el objeto, por eso no aparece arriba).
+- NO consideres palabras como "metal", "fierro", "hierro" dentro de un tipo de trabajo como material: si el cliente dice "puerta en metal", value_for_current_step podría ser "puerta", pero no se captura material.
+- ambito: "domestico" si dice casa, hogar, familia, personal, vivienda. "industrial" si dice empresa, negocio, industria, fábrica, comercial.
 - ruc: 11 dígitos consecutivos.
 - nombre: si dice "soy X", "me llamo X", "mi nombre es X", devuelve solo el nombre.
+- Si el cliente solo escribió un saludo corto (hola, buenas, buenos días, están atendiendo), trata el intent como "answer" con value_for_current_step null (no es out_of_order ni off_topic).
 - Responde SOLO con el JSON, sin texto adicional.`,
     },
     {
@@ -445,13 +616,13 @@ Mensaje del cliente: ${JSON.stringify(userText)}`,
 }
 
 // ============================================================================
-// Plantillas de respuesta
+// Plantillas
 // ============================================================================
 
 function greetingMessage() {
   return `Hola 🙂 Soy ${ASSISTANT_NAME}, asistente comercial de ${COMPANY_BRAND}. Con gusto te ayudo con tu cotización.
 
-Para comenzar, cuéntame qué tipo de trabajo deseas construir o fabricar?`;
+Para comenzar, cuéntame por favor qué tipo de trabajo deseas construir o fabricar (por ejemplo: portón metálico, escalera, baranda, ventana, estructura).`;
 }
 
 function askForStep(session, step) {
@@ -459,7 +630,7 @@ function askForStep(session, step) {
     case "tipo_trabajo":
       return "Cuéntame por favor, qué tipo de trabajo deseas construir o fabricar?";
     case "material":
-      return askMaterial(session.fields.tipo_trabajo);
+      return askMaterial(session?.fields?.tipo_trabajo);
     case "medidas":
       return askMedidas();
     case "ambito":
@@ -497,11 +668,11 @@ function suggestMaterialFor(tipoTrabajo) {
     return "perfil de aluminio o fierro 1x1 con vidrio templado de 6 mm";
   if (/(techo|estructura|cobertur)/.test(t))
     return "estructura de tubo cuadrado 2x4 con cobertura de calamina o policarbonato, pintura anticorrosiva";
-  if (/(escaler|pasamano|baranda)/.test(t))
+  if (/(escaler|pasamano)/.test(t))
     return "tubo redondo de 2 pulgadas en acero inoxidable o fierro pintado";
   if (/(mesa|mueble|silla|estanter)/.test(t))
     return "estructura de fierro cuadrado o redondo con acabado pintura electrostática y tablero de melamina o madera";
-  if (/(porton|portón|garaje|cochera)/.test(t))
+  if (/(garaje|cochera)/.test(t))
     return "plancha estriada o lisa sobre estructura de tubo cuadrado, con sistema corredizo o batiente";
   return "fierro estructural con pintura anticorrosiva, o acero inoxidable según el uso";
 }
@@ -532,21 +703,18 @@ function askNombreParaDirigirse() {
 
 function gentleRedirect(step) {
   return `Me parece interesante lo que comentas, pero centremos la conversación en tu cotización para avanzar bien. ${askForStep(
-    { fields: {} },
+    null,
     step
   )}`;
 }
 
 function outOfOrderRedirect(step) {
-  return `Anotado, en un momento llegamos a eso. Primero necesito: ${askForStep(
-    { fields: {} },
-    step
-  )}`;
+  return `Anotado, en un momento llegamos a eso. Primero necesito: ${askForStep(null, step)}`;
 }
 
 function warningEndingMessage(step) {
   return `Lamentablemente, si seguimos así tendré que finalizar la conversación. Volvamos al tema, por favor: ${askForStep(
-    { fields: {} },
+    null,
     step
   )}`;
 }
@@ -559,9 +727,24 @@ function farewellMessage() {
   return `Quedan validadas las especificaciones. Procederemos a preparar la cotización formal a la brevedad y nos pondremos en contacto contigo si necesitamos ajustar algún detalle. Muchas gracias por confiar en ${COMPANY_BRAND} 🙂`;
 }
 
+function closedAckMessage() {
+  return "Tu cotización ya está en proceso. Nuestro equipo se contactará contigo en breve. Gracias!";
+}
+
+function pushbackResponse(step) {
+  return `Disculpa la insistencia, lo confirmo para asegurar tu cotización. ${askForStep(null, step)}`;
+}
+
 // ============================================================================
 // Resumen y modificación
 // ============================================================================
+
+function formatPhone(num) {
+  const d = String(num || "").replace(/\D/g, "");
+  if (/^51\d{9}$/.test(d)) return `+51 ${d.slice(2, 5)} ${d.slice(5, 8)} ${d.slice(8)}`;
+  if (d.length > 0) return `+${d}`;
+  return num || "";
+}
 
 function firstName(full) {
   if (!full) return null;
@@ -576,7 +759,7 @@ function summaryText(session, contactNumber) {
   const lines = [
     "Resumen de tu cotización:",
     "",
-    `- Número de contacto: ${contactNumber}`,
+    `- Número de contacto: ${formatPhone(contactNumber)}`,
     `- Nombre del cliente: ${nombreCorto}`,
     "",
     `1) Tipo de trabajo: ${f.tipo_trabajo || "No especificado"}`,
@@ -586,7 +769,7 @@ function summaryText(session, contactNumber) {
     `5) Ubicación/referencia: ${f.ubicacion || "No especificado"}`,
     `6) RUC/Nombre: ${rucONombre}`,
     "",
-    "Si todo está correcto, escribe \"confirmo\" para que procedamos con la cotización formal. Si deseas modificar algún punto, indícame el número (1 a 6) y el nuevo dato.",
+    'Si todo está correcto, escribe "confirmo" para que procedamos con la cotización formal. Si deseas modificar algún punto, indícame el número (1 a 6) y el nuevo dato.',
   ];
   return lines.join("\n");
 }
@@ -623,47 +806,21 @@ function fieldQuestion(field) {
 }
 
 // ============================================================================
-// Avance del flujo: salta pasos cuyo dato ya está completo
+// Avance del flujo (orden estricto, sin auto-skip)
 // ============================================================================
 
-const LINEAR_STEPS = [
-  "tipo_trabajo",
-  "material",
-  "medidas",
-  "ambito",
-  "ubicacion_pedir",
-  "identificacion_ruc",
-];
-
-function isStepSatisfied(session, step) {
-  const f = session.fields;
-  switch (step) {
-    case "tipo_trabajo":
-      return Boolean(f.tipo_trabajo);
-    case "material":
-      return Boolean(f.material);
-    case "medidas":
-      return Boolean(f.medidas);
-    case "ambito":
-      return Boolean(f.ambito);
-    case "ubicacion_pedir":
-      return Boolean(f.ubicacion);
-    case "identificacion_ruc":
-      return Boolean(f.ruc || f.nombre);
-    default:
-      return false;
-  }
-}
-
-function nextLinearStep(session) {
-  for (const s of LINEAR_STEPS) {
-    if (!isStepSatisfied(session, s)) return s;
-  }
-  return "resumen_confirmar";
+function nextLinearStep(currentStep) {
+  let key = currentStep;
+  if (key === "ubicacion_confirmar") key = "ubicacion_pedir";
+  if (key === "identificacion_nombre") key = "identificacion_ruc";
+  const idx = LINEAR_STEPS.indexOf(key);
+  if (idx === -1) return "tipo_trabajo";
+  if (idx === LINEAR_STEPS.length - 1) return "resumen_confirmar";
+  return LINEAR_STEPS[idx + 1];
 }
 
 async function advanceAndAsk(session, from) {
-  const next = nextLinearStep(session);
+  const next = nextLinearStep(session.step);
   session.step = next;
   if (next === "resumen_confirmar") {
     await proceedToSummary(session, from);
@@ -693,24 +850,37 @@ async function proceedToSummary(session, from) {
 function applyCapturedOtherSteps(session, captured) {
   if (!captured || typeof captured !== "object") return;
   const f = session.fields;
-  if (captured.tipo_trabajo && !f.tipo_trabajo) f.tipo_trabajo = String(captured.tipo_trabajo).trim();
-  if (captured.material && !f.material) f.material = String(captured.material).trim();
-  if (captured.medidas && !f.medidas) f.medidas = String(captured.medidas).trim();
+
+  if (captured.tipo_trabajo && !f.tipo_trabajo && session.step !== "tipo_trabajo") {
+    const v = String(captured.tipo_trabajo).trim();
+    if (isValidTipoTrabajo(v)) f.tipo_trabajo = v;
+  }
+  // material NUNCA desde captured: se preguntará en su paso.
+
+  if (captured.medidas && !f.medidas) {
+    const v = String(captured.medidas).trim();
+    if (/\d/.test(v) && v.length >= 3) f.medidas = v;
+  }
   if (captured.ambito && !f.ambito) {
     const a = String(captured.ambito).toLowerCase();
     if (a === "domestico" || a === "doméstico") f.ambito = "doméstico/hogar";
     else if (a === "industrial") f.ambito = "industrial/empresa";
   }
-  if (captured.ubicacion && !f.ubicacion) f.ubicacion = String(captured.ubicacion).trim();
-  if (captured.ruc && !f.ruc) {
-    const onlyDigits = String(captured.ruc).replace(/\D/g, "");
-    if (/^\d{11}$/.test(onlyDigits)) f.ruc = onlyDigits;
+  if (captured.ubicacion && !f.ubicacion) {
+    const v = String(captured.ubicacion).trim();
+    if (v.length >= 4 && !isPushback(v)) f.ubicacion = v;
   }
-  if (captured.nombre && !f.nombre) f.nombre = String(captured.nombre).trim();
+  if (captured.ruc && !f.ruc) {
+    const d = String(captured.ruc).replace(/\D/g, "");
+    if (/^\d{11}$/.test(d)) f.ruc = d;
+  }
+  if (captured.nombre && !f.nombre && isValidName(captured.nombre)) {
+    f.nombre = String(captured.nombre).trim();
+  }
 }
 
 // ============================================================================
-// Inbound: extracción y reenvío de leads
+// Extracción del webhook
 // ============================================================================
 
 function extractInbound(body) {
@@ -758,13 +928,21 @@ async function forwardLead(text) {
 }
 
 // ============================================================================
-// Manejo de cada mensaje entrante
+// Anti-abuso
 // ============================================================================
+
+function currentAskableStep(session) {
+  const s = session.step;
+  if (s === "saludo") return "tipo_trabajo";
+  if (s === "ubicacion_confirmar") return "ubicacion_pedir";
+  if (s === "identificacion_nombre") return "identificacion_ruc";
+  return s;
+}
 
 async function handleAbuse(session, from) {
   session.warnings += 1;
   if (session.warnings >= 3) {
-    session.blockedUntil = Date.now() + COOLDOWN_MS;
+    session.blockedUntil = Date.now() + ABUSE_COOLDOWN_MS;
     session.step = "cerrado";
     await sendText(from, blockedFarewellMessage());
     return;
@@ -776,16 +954,11 @@ async function handleAbuse(session, from) {
   await sendText(from, gentleRedirect(currentAskableStep(session)));
 }
 
-function currentAskableStep(session) {
-  const s = session.step;
-  if (s === "saludo") return "tipo_trabajo";
-  if (s === "ubicacion_confirmar") return "ubicacion_pedir";
-  if (s === "identificacion_nombre") return "identificacion_ruc";
-  if (s === "resumen_confirmar" || s === "modificar_item" || s === "modificar_valor") return s;
-  return s;
-}
+// ============================================================================
+// Procesar mensaje
+// ============================================================================
 
-async function processImage(session, from, msg) {
+async function processImage(session, msg) {
   try {
     const dl = await downloadMedia(msg.mediaId);
     if (!dl) return null;
@@ -803,24 +976,37 @@ async function handleMessage(session, msg) {
   if (msg.profileName && !session.profileName) session.profileName = msg.profileName;
 
   const now = Date.now();
+
+  // Bloqueo silencioso por abuso (no respondemos nada).
   if (session.blockedUntil && session.blockedUntil > now) return;
 
+  // Conversación cerrada formalmente: acuse breve sin reabrir el flujo.
   if (session.step === "cerrado") {
+    if (session.closedUntil && session.closedUntil > now) {
+      if (!session.closedAckAt || now - session.closedAckAt > CLOSED_ACK_COOLDOWN_MS) {
+        await sendText(from, closedAckMessage());
+        session.closedAckAt = now;
+      }
+      return;
+    }
+    // Cooldown expirado: reiniciar como nueva conversación.
     const fresh = newSession();
     fresh.profileName = session.profileName;
     Object.assign(session, fresh);
   }
 
-  // Imagen: análisis y respuesta acorde al paso
+  // === Imagen entrante ===
   if (msg.type === "image" && msg.mediaId) {
-    const analysis = await processImage(session, from, msg);
+    const analysis = await processImage(session, msg);
     if (session.step === "saludo") {
       session.step = "tipo_trabajo";
       await sendText(from, greetingMessage());
       if (analysis && analysis.tipo_trabajo && analysis.tipo_trabajo !== "no claro") {
         await sendText(
           from,
-          `Recibí tu imagen referencial. En ella se aprecia: ${analysis.descripcion || analysis.tipo_trabajo}. Confírmame con tus palabras qué deseas construir o fabricar.`
+          `Recibí tu imagen referencial. En ella se aprecia: ${
+            analysis.descripcion || analysis.tipo_trabajo
+          }. Confírmame con tus palabras qué deseas construir o fabricar.`
         );
       } else {
         await sendText(from, "Recibí tu imagen y la usaré como referencia visual.");
@@ -861,20 +1047,35 @@ async function handleMessage(session, msg) {
 
   const userText = (msg.text || "").trim();
 
+  // === Saludo inicial: enviar greeting y salir (no clasificar el mismo texto) ===
   if (session.step === "saludo") {
     session.step = "tipo_trabajo";
     await sendText(from, greetingMessage());
-    if (!userText) return;
+    return;
   }
 
+  if (!userText) return;
+
+  // === Profanidad local (rápido, sin OpenAI) ===
   if (looksLikeProfanity(userText)) {
     return await handleAbuse(session, from);
   }
 
+  // === Pushback: el cliente dice que ya entregó la info ===
+  if (isPushback(userText)) {
+    await sendText(from, pushbackResponse(currentAskableStep(session)));
+    return;
+  }
+
+  // === Clasificador ===
   const cls = await classify(session, userText);
 
   if (cls.intent === "abuse") {
     return await handleAbuse(session, from);
+  }
+  if (cls.intent === "pushback") {
+    await sendText(from, pushbackResponse(currentAskableStep(session)));
+    return;
   }
 
   applyCapturedOtherSteps(session, cls.captured_for_other_steps);
@@ -914,13 +1115,16 @@ async function handleMessage(session, msg) {
 async function stepTipoTrabajo(session, from, userText, cls) {
   if (cls.intent === "off_topic") return await sendText(from, gentleRedirect("tipo_trabajo"));
   if (cls.intent === "out_of_order") return await sendText(from, outOfOrderRedirect("tipo_trabajo"));
-  const val = (cls.value_for_current_step || cls.captured_for_other_steps?.tipo_trabajo || userText || "").trim();
-  if (val.length >= 2) {
-    session.fields.tipo_trabajo = val;
-    await advanceAndAsk(session, from);
+  const candidate = (cls.value_for_current_step || cls.captured_for_other_steps?.tipo_trabajo || userText || "").trim();
+  if (!isValidTipoTrabajo(candidate)) {
+    await sendText(
+      from,
+      "Necesito un poco más de detalle, por favor. Qué tipo de trabajo deseas construir o fabricar? (por ejemplo: portón metálico, escalera, baranda, ventana, estructura)"
+    );
     return;
   }
-  await sendText(from, askForStep(session, "tipo_trabajo"));
+  session.fields.tipo_trabajo = candidate;
+  await advanceAndAsk(session, from);
 }
 
 async function stepMaterial(session, from, userText, cls) {
@@ -946,38 +1150,37 @@ async function stepMaterial(session, from, userText, cls) {
     await sendText(from, "Sin problema. Qué material o acabado prefieres entonces?");
     return;
   }
-  const val = (cls.value_for_current_step || cls.captured_for_other_steps?.material || userText || "").trim();
-  if (val.length >= 2) {
-    session.fields.material = val;
-    session.pendingMaterialSuggestion = null;
-    await advanceAndAsk(session, from);
+  const candidate = (cls.value_for_current_step || userText || "").trim();
+  if (!isValidMaterial(candidate, session.fields.tipo_trabajo)) {
+    await sendText(
+      from,
+      "Necesito un poco más de precisión en el material y/o acabado. Por ejemplo: acero inoxidable, fierro pintado, aluminio, con pintura electrostática o anticorrosiva, color X."
+    );
     return;
   }
-  await sendText(from, askForStep(session, "material"));
+  session.fields.material = candidate;
+  session.pendingMaterialSuggestion = null;
+  await advanceAndAsk(session, from);
 }
 
 async function stepMedidas(session, from, userText, cls) {
   if (cls.intent === "off_topic") return await sendText(from, gentleRedirect("medidas"));
   if (cls.intent === "out_of_order") return await sendText(from, outOfOrderRedirect("medidas"));
-  const val = (cls.value_for_current_step || cls.captured_for_other_steps?.medidas || userText || "").trim();
-  if (val.length >= 1) {
-    session.fields.medidas = val;
-    if (cls.intent === "approximate_size") {
-      await sendText(
-        from,
-        `Anotado, trabajaremos con esas medidas aproximadas para la cotización (${val}).`
-      );
-    }
-    await advanceAndAsk(session, from);
+  const candidate = (cls.value_for_current_step || cls.captured_for_other_steps?.medidas || userText || "").trim();
+  if (!candidate || candidate.length < 2 || isPushback(candidate)) {
+    await sendText(from, askForStep(session, "medidas"));
     return;
   }
-  await sendText(from, askForStep(session, "medidas"));
+  session.fields.medidas = candidate;
+  if (cls.intent === "approximate_size") {
+    await sendText(from, `Anotado, trabajaremos con esas medidas aproximadas para la cotización (${candidate}).`);
+  }
+  await advanceAndAsk(session, from);
 }
 
 async function stepAmbito(session, from, userText, cls) {
   if (cls.intent === "off_topic") return await sendText(from, gentleRedirect("ambito"));
   if (cls.intent === "out_of_order") return await sendText(from, outOfOrderRedirect("ambito"));
-  // Si ya quedó capturado por applyCaptured, avanza
   if (session.fields.ambito) {
     await advanceAndAsk(session, from);
     return;
@@ -1004,14 +1207,14 @@ async function stepUbicacionPedir(session, from, userText, cls) {
     await advanceAndAsk(session, from);
     return;
   }
-  const val = (cls.value_for_current_step || cls.captured_for_other_steps?.ubicacion || userText || "").trim();
-  if (val.length >= 2) {
-    session.pendingUbicacion = val;
-    session.step = "ubicacion_confirmar";
-    await sendText(from, confirmUbicacionText(val));
+  const candidate = (cls.value_for_current_step || cls.captured_for_other_steps?.ubicacion || userText || "").trim();
+  if (!candidate || candidate.length < 2) {
+    await sendText(from, askForStep(session, "ubicacion_pedir"));
     return;
   }
-  await sendText(from, askForStep(session, "ubicacion_pedir"));
+  session.pendingUbicacion = candidate;
+  session.step = "ubicacion_confirmar";
+  await sendText(from, confirmUbicacionText(candidate));
 }
 
 async function stepUbicacionConfirmar(session, from, userText, cls) {
@@ -1035,7 +1238,6 @@ async function stepUbicacionConfirmar(session, from, userText, cls) {
     await sendText(from, "Sin problema, por favor escríbeme nuevamente la ubicación o referencia.");
     return;
   }
-  // Tratar como nueva propuesta de ubicación
   if (userText) {
     session.pendingUbicacion = userText;
     await sendText(from, confirmUbicacionText(userText));
@@ -1051,7 +1253,7 @@ async function stepIdentificacionRuc(session, from, userText, cls) {
   const rucMatch = userText.match(/\b\d{11}\b/);
   if (rucMatch) {
     session.fields.ruc = rucMatch[0];
-    if (!session.fields.nombre) {
+    if (!session.fields.nombre || !isValidName(session.fields.nombre)) {
       session.step = "identificacion_nombre";
       await sendText(from, askNombreParaDirigirse());
       return;
@@ -1063,7 +1265,7 @@ async function stepIdentificacionRuc(session, from, userText, cls) {
     const r = String(cls.captured_for_other_steps.ruc).replace(/\D/g, "");
     if (/^\d{11}$/.test(r)) {
       session.fields.ruc = r;
-      if (!session.fields.nombre) {
+      if (!session.fields.nombre || !isValidName(session.fields.nombre)) {
         session.step = "identificacion_nombre";
         await sendText(from, askNombreParaDirigirse());
         return;
@@ -1072,9 +1274,9 @@ async function stepIdentificacionRuc(session, from, userText, cls) {
       return;
     }
   }
-  const nombreVal = (cls.captured_for_other_steps?.nombre || userText || "").trim();
-  if (nombreVal.length >= 2) {
-    session.fields.nombre = nombreVal;
+  const nombreCandidate = (cls.captured_for_other_steps?.nombre || userText || "").trim();
+  if (isValidName(nombreCandidate)) {
+    session.fields.nombre = nombreCandidate;
     await advanceAndAsk(session, from);
     return;
   }
@@ -1083,19 +1285,23 @@ async function stepIdentificacionRuc(session, from, userText, cls) {
 
 async function stepIdentificacionNombre(session, from, userText, cls) {
   if (cls.intent === "off_topic") return await sendText(from, gentleRedirect("identificacion_nombre"));
-  const nombreVal = (cls.captured_for_other_steps?.nombre || userText || "").trim();
-  if (nombreVal.length >= 2) {
-    session.fields.nombre = nombreVal;
-    await advanceAndAsk(session, from);
+  const nombreCandidate = (cls.captured_for_other_steps?.nombre || userText || "").trim();
+  if (!isValidName(nombreCandidate)) {
+    await sendText(from, askNombreParaDirigirse());
     return;
   }
-  await sendText(from, askNombreParaDirigirse());
+  session.fields.nombre = nombreCandidate;
+  await advanceAndAsk(session, from);
 }
 
 async function stepResumenConfirmar(session, from, userText, cls) {
   if (cls.intent === "abuse") return await handleAbuse(session, from);
   if (cls.intent === "off_topic") return await sendText(from, gentleRedirect("resumen_confirmar"));
-  if (cls.intent === "confirm" || /\bconfirmo\b/i.test(userText) || (looksLikeConfirm(userText) && !looksLikeDeny(userText))) {
+  if (
+    cls.intent === "confirm" ||
+    /\bconfirmo\b/i.test(userText) ||
+    (looksLikeConfirm(userText) && !looksLikeDeny(userText))
+  ) {
     await sendText(from, farewellMessage());
     try {
       await forwardLead(summaryText(session, from));
@@ -1103,7 +1309,8 @@ async function stepResumenConfirmar(session, from, userText, cls) {
       console.error("forwardLead error:", e);
     }
     session.step = "cerrado";
-    session.closed = true;
+    session.closedUntil = Date.now() + CLOSED_COOLDOWN_MS;
+    session.closedAckAt = 0;
     return;
   }
   if (cls.intent === "modify" || cls.intent === "deny" || looksLikeDeny(userText)) {
@@ -1116,7 +1323,7 @@ async function stepResumenConfirmar(session, from, userText, cls) {
   }
   await sendText(
     from,
-    "Si todo está correcto escribe \"confirmo\". Si deseas modificar, dime el número del 1 al 6 y el nuevo dato."
+    'Si todo está correcto escribe "confirmo". Si deseas modificar, dime el número del 1 al 6 y el nuevo dato.'
   );
 }
 
@@ -1131,7 +1338,6 @@ async function stepModificarItem(session, from, userText, cls) {
     return;
   }
   session.modifyingField = field;
-  // Si el cliente ya envió el nuevo valor en el mismo mensaje, intentamos aprovecharlo
   const newVal = extractValueForField(field, userText);
   if (newVal) {
     applyFieldUpdate(session, field, newVal);
@@ -1167,17 +1373,15 @@ async function stepModificarValor(session, from, userText, cls) {
 
 function extractValueForField(field, text) {
   if (!text) return null;
-  // Quitar la parte que solo indica el punto (1, 2, etc. o "el material:")
-  let cleaned = text
+  const cleaned = text
     .replace(/^\s*\b[1-6]\b[\s.):\-]*/i, "")
-    .replace(/^(el|la)?\s*(tipo de trabajo|material|acabado|medida[s]?|cantidad|ámbito|ambito|domést[ií]co|industrial|ubicaci[oó]n|direcci[oó]n|referencia|ruc|nombre)[\s:.\-]*/i, "")
+    .replace(
+      /^(el|la)?\s*(tipo de trabajo|material|acabado|medida[s]?|cantidad|ámbito|ambito|domést[ií]co|industrial|ubicaci[oó]n|direcci[oó]n|referencia|ruc|nombre)[\s:.\-]*/i,
+      ""
+    )
     .trim();
-  // Si tras limpiar no queda nada distinto, no es valor en línea
   if (!cleaned || cleaned.length < 2) return null;
-  if (cleaned.toLowerCase() === text.toLowerCase()) {
-    // No detectamos una etiqueta clara; mejor pedir aparte
-    return null;
-  }
+  if (cleaned.toLowerCase() === text.toLowerCase()) return null;
   return cleaned;
 }
 
@@ -1187,8 +1391,8 @@ function applyFieldUpdate(session, field, val) {
     if (rucMatch) {
       session.fields.ruc = rucMatch[0];
       const rest = val.replace(rucMatch[0], "").trim();
-      if (rest && rest.length >= 2) session.fields.nombre = rest;
-    } else {
+      if (isValidName(rest)) session.fields.nombre = rest;
+    } else if (isValidName(val)) {
       session.fields.nombre = val;
       session.fields.ruc = null;
     }
@@ -1209,7 +1413,7 @@ function applyFieldUpdate(session, field, val) {
 }
 
 // ============================================================================
-// Procesamiento del webhook
+// Loop principal
 // ============================================================================
 
 async function processInbound(body) {
@@ -1217,8 +1421,9 @@ async function processInbound(body) {
   const items = extractInbound(body);
   for (const msg of items) {
     if (!msg.from) continue;
-    if (isAlreadyProcessed(msg.id)) continue;
-    const session = getSession(msg.from);
+    const already = await markSeen(msg.id);
+    if (already) continue;
+    const session = await loadSession(msg.from);
     try {
       await handleMessage(session, msg);
     } catch (e) {
@@ -1229,6 +1434,12 @@ async function processInbound(body) {
           "Disculpa, tuve un inconveniente procesando tu mensaje. ¿Podrías intentar de nuevo en unos segundos?"
         );
       } catch {}
+    } finally {
+      try {
+        await saveSession(msg.from, session);
+      } catch (e) {
+        console.error("saveSession outer error:", e);
+      }
     }
   }
 }
