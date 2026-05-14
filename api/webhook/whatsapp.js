@@ -20,6 +20,7 @@
  */
 
 const { waitUntil } = require("@vercel/functions");
+const crypto = require("crypto");
 
 const GRAPH_VERSION = process.env.WHATSAPP_GRAPH_VERSION || "v22.0";
 const WHATSAPP_TEXT_MAX = 4000;
@@ -105,6 +106,7 @@ async function kvSetIfNew(key, ttlSeconds) {
 
 const sessionsMem = new Map();
 const processedIdsMem = new Map();
+const leadForwardLocksMem = new Map();
 
 function newSession() {
   return {
@@ -188,6 +190,38 @@ async function markSeen(messageId) {
     }
   }
   return false;
+}
+
+async function acquireLeadForwardLock(customerFrom, session) {
+  const lastImage = session.images.length ? session.images[session.images.length - 1]?.mediaId : null;
+  const leadFingerprint = crypto
+    .createHash("sha256")
+    .update(
+      JSON.stringify({
+        customerFrom,
+        fields: session.fields,
+        image: lastImage || "",
+      })
+    )
+    .digest("hex")
+    .slice(0, 24);
+  const key = `gladis:leadForward:${customerFrom}:${leadFingerprint}`;
+
+  if (kvEnabled()) {
+    return await kvSetIfNew(key, 24 * 60 * 60);
+  }
+
+  const now = Date.now();
+  const existing = leadForwardLocksMem.get(key);
+  if (existing && existing > now) return false;
+  leadForwardLocksMem.set(key, now + 24 * 60 * 60 * 1000);
+
+  if (leadForwardLocksMem.size > 1000) {
+    for (const [k, expiresAt] of leadForwardLocksMem) {
+      if (expiresAt <= now) leadForwardLocksMem.delete(k);
+    }
+  }
+  return true;
 }
 
 // ============================================================================
@@ -1132,14 +1166,21 @@ function getLeadRecipients() {
 }
 
 async function forwardLead(session, customerFrom) {
-  // Dedup: si ya se reenvió este lead en las últimas 24h, no repetir
-  // (cubre reintentos de Meta y carreras en serverless).
+  // Dedup local de sesión, útil si el mismo runtime procesa mensajes consecutivos.
   const now = Date.now();
   if (session.leadForwardedAt && now - session.leadForwardedAt < 24 * 60 * 60 * 1000) {
-    console.warn("forwardLead: lead ya reenviado recientemente, se omite");
+    console.warn("[forwardLead] omitido: lead ya reenviado en esta sesión");
     return;
   }
-  // Marcar antes de enviar para evitar duplicados si una segunda invocación entra en paralelo.
+
+  // Candado atómico persistente: evita duplicados aunque dos invocaciones entren en paralelo.
+  const lockAcquired = await acquireLeadForwardLock(customerFrom, session);
+  if (!lockAcquired) {
+    console.warn("[forwardLead] omitido: candado de lead duplicado activo");
+    return;
+  }
+
+  // Marcar antes de enviar como segunda defensa.
   session.leadForwardedAt = now;
 
   const recipients = getLeadRecipients();
