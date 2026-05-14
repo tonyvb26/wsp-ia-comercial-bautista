@@ -1106,11 +1106,6 @@ async function forwardLead(session, customerFrom) {
   const recipients = getLeadRecipients();
   if (!recipients.length) return;
 
-  console.log("[forwardLead] inicio", {
-    destinatarios: recipients,
-    cliente: customerFrom,
-  });
-
   const intro =
     "Hola Yojan 🙋🏻‍♀️ Un nuevo Cliente se ha comunicado con nosotros y estos son las especificaciones del proyecto 📝, comunícate con él enviándole la cotización a la brevedad posible o para hacer alguna consulta adicional, que tengas un buen día 🙂";
   const summary = summaryForForwardText(session, customerFrom);
@@ -1121,17 +1116,26 @@ async function forwardLead(session, customerFrom) {
     forwardImageId = await reuploadImageForOurNumber(last.mediaId);
   }
 
+  const results = [];
   for (const to of recipients) {
     const okIntro = await sendText(to, intro);
-    console.log("[forwardLead] intro", { to, ok: okIntro });
+    const row = { to, intro: okIntro };
     if (forwardImageId) {
-      const okImg = await sendImage(to, forwardImageId);
-      console.log("[forwardLead] imagen", { to, ok: okImg });
+      row.img = await sendImage(to, forwardImageId);
     }
-    const okSum = await sendText(to, summary);
-    console.log("[forwardLead] resumen", { to, ok: okSum });
+    row.summary = await sendText(to, summary);
+    results.push(row);
   }
-  console.log("[forwardLead] fin");
+  // Una sola línea: Vercel a veces solo muestra un mensaje por request en la tabla de logs.
+  console.log(
+    "[forwardLead] " +
+      JSON.stringify({
+        recipients,
+        cliente: customerFrom,
+        imagen: Boolean(forwardImageId),
+        results,
+      })
+  );
 }
 
 // ============================================================================
