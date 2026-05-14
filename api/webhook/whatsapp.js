@@ -122,6 +122,9 @@ function newSession() {
     pendingUbicacion: null,
     pendingMaterialSuggestion: null,
     pendingMaterialBaseFrom: null,
+    pendingMaterialDescription: null,
+    pendingMaterialProposal: null,
+    leadForwardedAt: 0,
     modifyingField: null,
     warnings: 0,
     blockedUntil: 0,
@@ -332,6 +335,54 @@ async function openaiJSON(messages, { model = OPENAI_MODEL, temperature = 0.2 } 
   } catch (e) {
     console.error("OpenAI JSON exception", e);
     return null;
+  }
+}
+
+async function unifyMaterialDescription(userText, analysis) {
+  const fallbackParts = [analysis?.material, analysis?.acabado, analysis?.descripcion]
+    .filter((x) => x && x !== "no claro");
+  const fallback = fallbackParts.length
+    ? `${userText} (de la imagen referencial: ${fallbackParts.join(", ")})`
+    : userText;
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return fallback;
+  try {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        temperature: 0.3,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Eres un asistente para cotizaciones de carpintería metálica y fabricación. Recibes la descripción que dio un cliente y los datos extraídos de una imagen referencial. Devuelve UNA sola oración natural en español que combine ambas fuentes describiendo material, acabado y detalles visuales del trabajo. Máximo 280 caracteres. Sin etiquetas, sin viñetas, sin explicaciones, solo la oración final.",
+          },
+          {
+            role: "user",
+            content: `Descripción del cliente: "${userText}".\n\nDe la imagen se aprecia:\n- material: ${
+              analysis?.material || "no claro"
+            }\n- acabado: ${analysis?.acabado || "no claro"}\n- descripción: ${
+              analysis?.descripcion || "no claro"
+            }\n\nGenera una sola oración combinada que describa con detalle material, acabado y detalles visuales.`,
+          },
+        ],
+      }),
+    });
+    if (!r.ok) {
+      console.error("unifyMaterialDescription error", r.status, await r.text());
+      return fallback;
+    }
+    const data = await r.json();
+    const txt = data.choices?.[0]?.message?.content?.trim();
+    return txt || fallback;
+  } catch (e) {
+    console.error("unifyMaterialDescription exception", e);
+    return fallback;
   }
 }
 
@@ -598,6 +649,10 @@ function describeStep(step) {
       return "preguntar material o acabado";
     case "material_base":
       return "el cliente debe especificar el material base (acero, fierro o aluminio)";
+    case "material_await_image":
+      return "esperar si el cliente enviará una imagen referencial para complementar la descripción";
+    case "material_confirm_proposal":
+      return "el cliente debe confirmar la propuesta combinada (descripción + imagen)";
     case "medidas":
       return "preguntar cantidad y medidas (área o metros)";
     case "ambito":
@@ -727,13 +782,13 @@ function askForStep(session, step) {
 
 function askMaterial(tipoTrabajo) {
   const base = tipoTrabajo
-    ? `Anoté: ${tipoTrabajo}.\n\nAhora, qué material o acabado tienes en mente?`
-    : "Qué material o acabado tienes en mente?";
+    ? `Anoté: ${tipoTrabajo}.\n\nAhora cuéntame por favor sobre el material, acabado y detalles visuales del proyecto. Descríbelo lo mejor posible (material base, color, textura, estilo, acabado, terminaciones, etc.).`
+    : "Cuéntame por favor sobre el material, acabado y detalles visuales del proyecto. Descríbelo lo mejor posible (material base, color, textura, estilo, acabado, terminaciones, etc.).";
   const refs = `Si quieres referencias visuales puedes revisar:
 - Web: ${COMPANY_WEB_URL}
 - Facebook: ${COMPANY_FB_URL}
 
-Si no tienes idea, dímelo y te sugiero opciones. Si tienes una imagen referencial, envíamela y la analizo.`;
+Si tienes una imagen referencial, envíamela y la uniré con tu descripción para proponerte una propuesta clara. Si no tienes idea, dímelo y te sugiero opciones.`;
   return `${base}\n\n${refs}`;
 }
 
@@ -818,8 +873,15 @@ function pushbackResponse(step) {
 // Resumen y modificación
 // ============================================================================
 
-function formatPhone(num) {
+function normalizePeruPhone(num) {
   const d = String(num || "").replace(/\D/g, "");
+  if (!d) return "";
+  if (/^9\d{8}$/.test(d)) return "51" + d;
+  return d;
+}
+
+function formatPhone(num) {
+  const d = normalizePeruPhone(num);
   if (/^51\d{9}$/.test(d)) return `+51 ${d.slice(2, 5)} ${d.slice(5, 8)} ${d.slice(8)}`;
   if (d.length > 0) return `+${d}`;
   return num || "";
@@ -903,6 +965,8 @@ function fieldQuestion(field) {
 function nextLinearStep(currentStep) {
   let key = currentStep;
   if (key === "material_base") key = "material";
+  if (key === "material_await_image") key = "material";
+  if (key === "material_confirm_proposal") key = "material";
   if (key === "ubicacion_confirmar") key = "ubicacion_pedir";
   if (key === "identificacion_nombre") key = "identificacion_ruc";
   const idx = LINEAR_STEPS.indexOf(key);
@@ -1017,12 +1081,22 @@ function getLeadRecipients() {
   const defaults = ["972324798", "971193243"];
   const extra = String(process.env.LEAD_FORWARD_TO || "")
     .split(/[,;\s]+/)
-    .map((x) => x.replace(/\D/g, ""))
     .filter(Boolean);
-  return [...new Set([...defaults, ...extra])];
+  const all = [...defaults, ...extra].map(normalizePeruPhone).filter(Boolean);
+  return [...new Set(all)];
 }
 
 async function forwardLead(session, customerFrom) {
+  // Dedup: si ya se reenvió este lead en las últimas 24h, no repetir
+  // (cubre reintentos de Meta y carreras en serverless).
+  const now = Date.now();
+  if (session.leadForwardedAt && now - session.leadForwardedAt < 24 * 60 * 60 * 1000) {
+    console.warn("forwardLead: lead ya reenviado recientemente, se omite");
+    return;
+  }
+  // Marcar antes de enviar para evitar duplicados si una segunda invocación entra en paralelo.
+  session.leadForwardedAt = now;
+
   const recipients = getLeadRecipients();
   if (!recipients.length) return;
 
@@ -1053,6 +1127,8 @@ function currentAskableStep(session) {
   const s = session.step;
   if (s === "saludo") return "tipo_trabajo";
   if (s === "material_base") return "material";
+  if (s === "material_await_image") return "material";
+  if (s === "material_confirm_proposal") return "material";
   if (s === "ubicacion_confirmar") return "ubicacion_pedir";
   if (s === "identificacion_nombre") return "identificacion_ruc";
   return s;
@@ -1158,7 +1234,27 @@ async function handleMessage(session, msg) {
       }
       return;
     }
-    if (session.step === "material" && analysis) {
+    if (
+      (session.step === "material" ||
+        session.step === "material_await_image" ||
+        session.step === "material_confirm_proposal") &&
+      analysis
+    ) {
+      // Si el cliente ya describió antes con texto, unir descripción + imagen y proponer.
+      if (session.pendingMaterialDescription) {
+        const propuesta = await unifyMaterialDescription(
+          session.pendingMaterialDescription,
+          analysis
+        );
+        session.pendingMaterialProposal = propuesta;
+        session.step = "material_confirm_proposal";
+        await sendText(
+          from,
+          `Uniendo lo que me describiste con la imagen, propongo lo siguiente:\n\n"${propuesta}"\n\n¿Estás de acuerdo con esta propuesta? Responde "sí" para continuar, o descríbeme con más detalle si prefieres ajustar.`
+        );
+        return;
+      }
+      // Solo imagen sin descripción previa: propuesta directa del análisis.
       const pieces = [analysis.material, analysis.acabado]
         .filter((x) => x && x !== "no claro")
         .join(" con acabado ");
@@ -1166,7 +1262,7 @@ async function handleMessage(session, msg) {
         session.pendingMaterialSuggestion = pieces;
         await sendText(
           from,
-          `Por la imagen, el material posible sería: ${pieces}. Trabajamos con esa propuesta o prefieres otro material?`
+          `Por la imagen, el material posible sería: ${pieces}.\n\n¿Trabajamos con esa propuesta o prefieres complementar con tu propia descripción del material, acabado y detalles visuales?`
         );
         return;
       }
@@ -1232,6 +1328,10 @@ async function handleMessage(session, msg) {
       return await stepMaterial(session, from, userText, cls);
     case "material_base":
       return await stepMaterialBase(session, from, userText, cls);
+    case "material_await_image":
+      return await stepMaterialAwaitImage(session, from, userText, cls);
+    case "material_confirm_proposal":
+      return await stepMaterialConfirmProposal(session, from, userText, cls);
     case "medidas":
       return await stepMedidas(session, from, userText, cls);
     case "ambito":
@@ -1289,6 +1389,7 @@ async function stepMaterial(session, from, userText, cls) {
   if (cls.intent === "confirm" && session.pendingMaterialSuggestion) {
     session.fields.material = session.pendingMaterialSuggestion;
     session.pendingMaterialSuggestion = null;
+    session.pendingMaterialDescription = null;
     await advanceAndAsk(session, from);
     return;
   }
@@ -1301,7 +1402,20 @@ async function stepMaterial(session, from, userText, cls) {
   if (!isValidMaterial(candidate, session.fields.tipo_trabajo)) {
     await sendText(
       from,
-      "Necesito un poco más de precisión en el material y/o acabado. Por ejemplo: acero inoxidable, fierro pintado, aluminio, con pintura electrostática o anticorrosiva, color X."
+      "Necesito un poco más de precisión en el material, acabado y detalles visuales. Por ejemplo: acero inoxidable, fierro pintado, aluminio, con pintura electrostática o anticorrosiva, color X, etc."
+    );
+    return;
+  }
+  // Si ya hay imagen analizada previa, unir texto + imagen y proponer al cliente.
+  const lastImage = session.images.length ? session.images[session.images.length - 1] : null;
+  if (lastImage?.analysis) {
+    session.pendingMaterialDescription = candidate;
+    const propuesta = await unifyMaterialDescription(candidate, lastImage.analysis);
+    session.pendingMaterialProposal = propuesta;
+    session.step = "material_confirm_proposal";
+    await sendText(
+      from,
+      `Uniendo tu descripción con la imagen referencial, propongo lo siguiente:\n\n"${propuesta}"\n\n¿Estás de acuerdo con esta propuesta? Responde "sí" para continuar, o descríbeme con más detalle si prefieres ajustar.`
     );
     return;
   }
@@ -1315,9 +1429,122 @@ async function stepMaterial(session, from, userText, cls) {
     );
     return;
   }
-  session.fields.material = candidate;
-  session.pendingMaterialSuggestion = null;
-  await advanceAndAsk(session, from);
+  // Sin imagen aún: guardar descripción y preguntar si va a enviar una imagen referencial.
+  session.pendingMaterialDescription = candidate;
+  session.step = "material_await_image";
+  await sendText(
+    from,
+    'Anotado. ¿Tienes una imagen referencial que quieras adjuntar para complementar tu descripción? Si la tienes, envíamela; si no tienes imagen, responde "continuar" o "sin imagen" y avanzamos.'
+  );
+}
+
+async function stepMaterialAwaitImage(session, from, userText, cls) {
+  if (cls.intent === "abuse") return await handleAbuse(session, from);
+  if (cls.intent === "off_topic") return await sendText(from, gentleRedirect("material"));
+
+  const t = (userText || "").toLowerCase().trim();
+  const wantsContinue =
+    /(sin\s+imagen|no\s+tengo\s+imagen|no\s+ten[ée]\s+imagen|no\s+hay\s+imagen|continuar|continuemos|sigamos|avanzar|adelante|ninguna|nada\s+m[áa]s)/i.test(
+      t
+    ) ||
+    cls.intent === "confirm" ||
+    /^(no|nope|nop)\b\s*$/i.test(t);
+
+  if (wantsContinue) {
+    const finalMat = (session.pendingMaterialDescription || "").trim();
+    session.pendingMaterialDescription = null;
+    if (!isValidMaterial(finalMat, session.fields.tipo_trabajo)) {
+      session.step = "material";
+      await sendText(
+        from,
+        "Necesito un poco más de precisión en el material, acabado y detalles visuales. Por ejemplo: acero inoxidable, fierro pintado, aluminio, con pintura electrostática o anticorrosiva, color X."
+      );
+      return;
+    }
+    if (materialNeedsBaseClarification(finalMat)) {
+      session.pendingMaterialBaseFrom = finalMat;
+      session.step = "material_base";
+      await sendText(
+        from,
+        'Cuando dices "metal", ¿a qué te refieres específicamente: acero, fierro o aluminio?'
+      );
+      return;
+    }
+    session.fields.material = finalMat;
+    session.pendingMaterialSuggestion = null;
+    session.step = "material";
+    await advanceAndAsk(session, from);
+    return;
+  }
+
+  // El cliente reformuló su descripción en lugar de responder sobre la imagen.
+  if (userText && userText.trim().length > 5) {
+    session.pendingMaterialDescription = userText.trim();
+    await sendText(
+      from,
+      'Anotado, actualicé tu descripción. ¿Tienes una imagen referencial para complementarla? Envíamela ahora, o responde "continuar" para avanzar sin imagen.'
+    );
+    return;
+  }
+
+  // Respuesta corta y ambigua: repetir la pregunta.
+  await sendText(
+    from,
+    'Si tienes una imagen referencial, envíamela ahora y la uniré con tu descripción. Si no tienes imagen, responde "continuar" para avanzar.'
+  );
+}
+
+async function stepMaterialConfirmProposal(session, from, userText, cls) {
+  if (cls.intent === "abuse") return await handleAbuse(session, from);
+  if (cls.intent === "off_topic") return await sendText(from, gentleRedirect("material"));
+
+  if (cls.intent === "confirm" || looksLikeConfirm(userText)) {
+    const finalMat = session.pendingMaterialProposal;
+    session.fields.material = finalMat;
+    session.pendingMaterialProposal = null;
+    session.pendingMaterialDescription = null;
+    session.pendingMaterialSuggestion = null;
+    session.step = "material";
+    await advanceAndAsk(session, from);
+    return;
+  }
+
+  if (cls.intent === "deny" || looksLikeDeny(userText)) {
+    session.pendingMaterialProposal = null;
+    session.pendingMaterialDescription = null;
+    session.step = "material";
+    await sendText(
+      from,
+      "Sin problema. Por favor descríbeme con el mayor detalle posible el material, acabado y detalles visuales del trabajo que tienes en mente."
+    );
+    return;
+  }
+
+  // Si el cliente envió una nueva descripción en vez de confirmar, re-unir con la imagen.
+  if (userText && userText.trim().length > 5) {
+    const lastImage = session.images.length ? session.images[session.images.length - 1] : null;
+    if (lastImage?.analysis) {
+      session.pendingMaterialDescription = userText.trim();
+      const propuesta = await unifyMaterialDescription(userText.trim(), lastImage.analysis);
+      session.pendingMaterialProposal = propuesta;
+      await sendText(
+        from,
+        `Actualicé la propuesta:\n\n"${propuesta}"\n\n¿Estás de acuerdo? Responde "sí" para continuar, o ajusta con otra descripción si prefieres.`
+      );
+      return;
+    }
+    // Sin imagen disponible: tratar texto como nuevo intento de descripción del material.
+    session.pendingMaterialProposal = null;
+    session.pendingMaterialDescription = userText.trim();
+    session.step = "material";
+    await stepMaterial(session, from, userText, cls);
+    return;
+  }
+
+  await sendText(
+    from,
+    `¿Trabajamos con esta propuesta?:\n\n"${session.pendingMaterialProposal}"\n\nResponde "sí" para continuar, o descríbeme con más detalle si prefieres ajustar.`
+  );
 }
 
 async function stepMaterialBase(session, from, userText, cls) {
