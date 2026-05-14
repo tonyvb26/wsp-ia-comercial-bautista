@@ -237,7 +237,8 @@ async function sendText(to, text) {
     }),
   });
   if (!r.ok) {
-    console.error("WhatsApp text send error", r.status, await r.text());
+    const errBody = await r.text();
+    console.error("WhatsApp text send error", { to, status: r.status, body: errBody });
   }
 }
 
@@ -260,7 +261,8 @@ async function sendImage(to, mediaId) {
     }),
   });
   if (!r.ok) {
-    console.error("WhatsApp image send error", r.status, await r.text());
+    const errBody = await r.text();
+    console.error("WhatsApp image send error", { to, status: r.status, body: errBody });
   }
 }
 
