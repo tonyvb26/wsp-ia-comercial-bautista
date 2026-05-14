@@ -9,9 +9,13 @@ async function graphJson(path, accessToken, options = {}) {
     url.searchParams.set("fields", options.fields);
   }
 
-  const response = await fetch(url, {
-    method: options.method || "GET",
-  });
+  const method = options.method || "GET";
+  const init = { method };
+  if (method === "POST") {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = "{}";
+  }
+  const response = await fetch(url, init);
   const text = await response.text();
 
   let data;
