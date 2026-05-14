@@ -23,7 +23,7 @@ WEBHOOK — URL pública HTTPS y token (Meta → Configuración → Webhook)
 
    Opción B — Prueba local con túnel (URL cambia cada vez en plan gratis de ngrok)
    - npm install && set WHATSAPP_VERIFY_TOKEN=tu_clave (Windows) o export en Linux/Mac
-   - node server.js
+   - node scripts/express-dev-server.js
    - ngrok http 3000 → usa https://xxxx.ngrok-free.app/webhook/whatsapp
 
 4) EN META

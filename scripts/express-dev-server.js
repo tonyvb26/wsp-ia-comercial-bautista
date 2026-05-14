@@ -1,15 +1,13 @@
 /**
- * Webhook para WhatsApp Cloud API (Meta).
- * - GET: verificación al pulsar "Verificar y guardar"
- * - POST: eventos entrantes (mensajes, estados, etc.)
+ * Servidor Express solo para desarrollo local o PaaS tipo Render (npm start).
+ * En Vercel NO debe existir server.js en la raíz: Vercel lo detecta como "legacy
+ * server" y deja de enrutar /webhook/whatsapp a api/webhook/whatsapp.js (Gladis).
  *
- * Variables de entorno:
- *   WHATSAPP_VERIFY_TOKEN  (obligatorio) mismo valor que "Token de verificación" en Meta
- *   PORT                   (opcional, Render/Railway lo suelen inyectar)
+ * Variables: WHATSAPP_VERIFY_TOKEN (obligatorio), PORT (opcional, default 3000).
  */
 const express = require("express");
 
-const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
+const VERIFY_TOKEN = String(process.env.WHATSAPP_VERIFY_TOKEN || "").trim();
 const PORT = Number(process.env.PORT) || 3000;
 
 if (!VERIFY_TOKEN) {
@@ -19,25 +17,20 @@ if (!VERIFY_TOKEN) {
 
 const app = express();
 
-// Meta envía JSON en POST; límite razonable para payloads de webhook
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => {
   res.status(200).type("text/plain").send("ok");
 });
 
-/**
- * Ruta que debes pegar en Meta como URL de devolución de llamada:
- *   https://TU-DOMINIO-PUBLICO/webhook/whatsapp
- */
 app.get("/webhook/whatsapp", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
+  const mode = String(req.query["hub.mode"] ?? "").trim();
+  const token = String(req.query["hub.verify_token"] ?? "").trim();
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
     console.log("Webhook verificado correctamente.");
-    return res.status(200).send(challenge);
+    return res.status(200).send(challenge !== undefined && challenge !== null ? String(challenge) : "");
   }
 
   console.warn("Verificación fallida:", { mode, tokenMatch: token === VERIFY_TOKEN });
@@ -45,7 +38,6 @@ app.get("/webhook/whatsapp", (req, res) => {
 });
 
 app.post("/webhook/whatsapp", (req, res) => {
-  // Responder rápido; el procesamiento pesado debe ir en cola/async más adelante
   res.sendStatus(200);
 
   const body = req.body;
@@ -53,7 +45,6 @@ app.post("/webhook/whatsapp", (req, res) => {
     return;
   }
 
-  // Aquí llegarán mensajes entrantes; por ahora solo registro en consola
   try {
     console.log("Webhook POST:", JSON.stringify(body, null, 2));
   } catch {
@@ -64,6 +55,6 @@ app.post("/webhook/whatsapp", (req, res) => {
 app.use((_req, res) => res.sendStatus(404));
 
 app.listen(PORT, () => {
-  console.log(`Webhook escuchando en puerto ${PORT}`);
-  console.log(`Verificación GET: /webhook/whatsapp`);
+  console.log(`[dev] Webhook escuchando en puerto ${PORT} (solo pruebas; en producción usa Vercel + api/webhook/whatsapp.js)`);
+  console.log(`[dev] Verificación GET: /webhook/whatsapp`);
 });

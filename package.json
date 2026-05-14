@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "description": "Webhook HTTPS para WhatsApp Cloud API (Meta)",
-  "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node scripts/express-dev-server.js",
+    "dev:server": "node scripts/express-dev-server.js"
   },
   "engines": {
     "node": ">=18"
