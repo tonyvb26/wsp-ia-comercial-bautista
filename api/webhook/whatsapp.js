@@ -218,10 +218,10 @@ async function sendText(to, text) {
   const access = process.env.WHATSAPP_ACCESS_TOKEN;
   if (!phoneId || !access) {
     console.error("Faltan WHATSAPP_PHONE_NUMBER_ID o WHATSAPP_ACCESS_TOKEN");
-    return;
+    return false;
   }
   const body = (text || "").slice(0, WHATSAPP_TEXT_MAX);
-  if (!body.trim()) return;
+  if (!body.trim()) return false;
   const url = `https://graph.facebook.com/${GRAPH_VERSION}/${phoneId}/messages`;
   const r = await fetch(url, {
     method: "POST",
@@ -239,13 +239,15 @@ async function sendText(to, text) {
   if (!r.ok) {
     const errBody = await r.text();
     console.error("WhatsApp text send error", { to, status: r.status, body: errBody });
+    return false;
   }
+  return true;
 }
 
 async function sendImage(to, mediaId) {
   const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
   const access = process.env.WHATSAPP_ACCESS_TOKEN;
-  if (!phoneId || !access || !mediaId) return;
+  if (!phoneId || !access || !mediaId) return false;
   const url = `https://graph.facebook.com/${GRAPH_VERSION}/${phoneId}/messages`;
   const r = await fetch(url, {
     method: "POST",
@@ -263,7 +265,9 @@ async function sendImage(to, mediaId) {
   if (!r.ok) {
     const errBody = await r.text();
     console.error("WhatsApp image send error", { to, status: r.status, body: errBody });
+    return false;
   }
+  return true;
 }
 
 async function downloadMedia(mediaId) {
@@ -1102,6 +1106,11 @@ async function forwardLead(session, customerFrom) {
   const recipients = getLeadRecipients();
   if (!recipients.length) return;
 
+  console.log("[forwardLead] inicio", {
+    destinatarios: recipients,
+    cliente: customerFrom,
+  });
+
   const intro =
     "Hola Yojan 🙋🏻‍♀️ Un nuevo Cliente se ha comunicado con nosotros y estos son las especificaciones del proyecto 📝, comunícate con él enviándole la cotización a la brevedad posible o para hacer alguna consulta adicional, que tengas un buen día 🙂";
   const summary = summaryForForwardText(session, customerFrom);
@@ -1113,12 +1122,16 @@ async function forwardLead(session, customerFrom) {
   }
 
   for (const to of recipients) {
-    await sendText(to, intro);
+    const okIntro = await sendText(to, intro);
+    console.log("[forwardLead] intro", { to, ok: okIntro });
     if (forwardImageId) {
-      await sendImage(to, forwardImageId);
+      const okImg = await sendImage(to, forwardImageId);
+      console.log("[forwardLead] imagen", { to, ok: okImg });
     }
-    await sendText(to, summary);
+    const okSum = await sendText(to, summary);
+    console.log("[forwardLead] resumen", { to, ok: okSum });
   }
+  console.log("[forwardLead] fin");
 }
 
 // ============================================================================
