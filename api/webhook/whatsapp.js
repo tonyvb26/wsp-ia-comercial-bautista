@@ -120,6 +120,7 @@ function newSession() {
     images: [],
     pendingUbicacion: null,
     pendingMaterialSuggestion: null,
+    pendingMaterialBaseFrom: null,
     modifyingField: null,
     warnings: 0,
     blockedUntil: 0,
@@ -512,6 +513,63 @@ function isValidName(val) {
   return true;
 }
 
+// ===== Cantidad y material base =====
+
+const MATERIAL_SPECIFICS_RE =
+  /\b(acero(?:\s+inoxidable)?|inox(?:idable)?|fierro|hierro|aluminio|galvanizad\w*|laf|lac|laminad\w*|cobre|bronce|madera|melamina|vidrio|policarbonat\w*|calamina|drywall|pvc)\b/i;
+
+const MATERIAL_GENERIC_LEADING_RE =
+  /^\s*(metal|met[áa]lic[oa]s?)\b[\s.,;:-]*/i;
+
+function materialNeedsBaseClarification(text) {
+  if (!text) return false;
+  if (MATERIAL_SPECIFICS_RE.test(text)) return false;
+  return MATERIAL_GENERIC_LEADING_RE.test(text);
+}
+
+function stripGenericMetalPrefix(text) {
+  if (!text) return "";
+  let s = String(text).replace(MATERIAL_GENERIC_LEADING_RE, "");
+  s = s.replace(/^\s*(con|de|en|y)\s+/i, "");
+  return s.trim();
+}
+
+const QUANTITY_NOUNS_RE =
+  /(port[oó]n(?:es)?|puerta[s]?|ventana[s]?|escalera[s]?|baranda[s]?|reja[s]?|estructura[s]?|techo[s]?|coberturas?|mesa[s]?|silla[s]?|mueble[s]?|garaje[s]?|cochera[s]?|cerco[s]?|cercad[oa]s?|pasamanos?|estanter[íi]as?)/i;
+
+function extractQuantityHint(text) {
+  if (!text) return null;
+  const t = String(text).toLowerCase();
+  const single = t.match(
+    new RegExp(`\\b(?:un(?:o|a)?\\s+sol[oa]|sol[oa]\\s+un[oa]?|[úu]nic[oa])\\s+${QUANTITY_NOUNS_RE.source}`, "i")
+  );
+  if (single) return { count: 1, noun: single[1] };
+  const num = t.match(new RegExp(`\\b(\\d+)\\s+${QUANTITY_NOUNS_RE.source}`, "i"));
+  if (num) return { count: parseInt(num[1], 10), noun: num[2] };
+  const article = t.match(new RegExp(`\\b(?:un|una)\\s+${QUANTITY_NOUNS_RE.source}`, "i"));
+  if (article) return { count: 1, noun: article[1] };
+  return null;
+}
+
+function ensureQuantityInMedidas(userText, candidate) {
+  if (!candidate) return candidate;
+  const qty = extractQuantityHint(userText);
+  if (!qty) return candidate;
+  const candLow = candidate.toLowerCase();
+  const nounStem = qty.noun.toLowerCase().replace(/(es|s)$/i, "");
+  const hasQtyAtStart = /^\s*(\d+|un[oa]?|sol[oa])\b/.test(candLow);
+  const mentionsNoun = candLow.includes(nounStem);
+  if (hasQtyAtStart && mentionsNoun) return candidate;
+  const label =
+    qty.count === 1
+      ? `1 ${qty.noun}`
+      : `${qty.count} ${qty.noun.endsWith("s") ? qty.noun : qty.noun + "s"}`;
+  if (mentionsNoun) {
+    return candidate.replace(new RegExp(qty.noun, "i"), label);
+  }
+  return `${label}, ${candidate}`;
+}
+
 // ============================================================================
 // Clasificador OpenAI por turno
 // ============================================================================
@@ -524,6 +582,8 @@ function describeStep(step) {
       return "preguntar qué desea construir o fabricar";
     case "material":
       return "preguntar material o acabado";
+    case "material_base":
+      return "el cliente debe especificar el material base (acero, fierro o aluminio)";
     case "medidas":
       return "preguntar cantidad y medidas (área o metros)";
     case "ambito":
@@ -587,8 +647,13 @@ Definiciones:
 Reglas estrictas:
 - "value_for_current_step" debe ser una versión limpia y breve de la respuesta para el paso actual, o null si no aplica.
 - En "captured_for_other_steps" incluye SOLO valores claramente expresados en este mensaje. NO inventes.
-- NUNCA extraigas "material" en captured_for_other_steps: el material se debe preguntar siempre en su paso (no incluyas la clave material en el objeto, por eso no aparece arriba).
-- NO consideres palabras como "metal", "fierro", "hierro" dentro de un tipo de trabajo como material: si el cliente dice "puerta en metal", value_for_current_step podría ser "puerta", pero no se captura material.
+- NUNCA captures "material" en captured_for_other_steps (la clave 'material' no existe arriba): el material se preguntará en su propio paso.
+- En el paso tipo_trabajo, "value_for_current_step" DEBE preservar la descripción completa que dio el usuario (ej. "portón en metal", "puerta corrediza de fierro", "escalera tipo caracol"). Solo elimina saludos o muletillas iniciales. NO acortes a una sola palabra ni quites adjetivos como "en metal", "metálico", "corrediza", etc.
+- En el paso material, si el usuario dice solo "metal" o "metálico" sin precisar acero/fierro/aluminio, deja "value_for_current_step" con esa frase tal cual; el servidor se encargará de repreguntar el material base.
+- En el paso medidas, "value_for_current_step" DEBE incluir la cantidad de unidades cuando el usuario la mencione, junto con las dimensiones. Ejemplos:
+   * "un solo portón, 5 metros de ancho por 1 metro de largo" → "1 portón de 5 m de ancho x 1 m de largo"
+   * "necesito 3 ventanas de 1.2 x 1.5" → "3 ventanas de 1.2 m x 1.5 m"
+   * Si el usuario solo da dimensiones sin cantidad explícita, devuelve solo las dimensiones.
 - ambito: "domestico" si dice casa, hogar, familia, personal, vivienda. "industrial" si dice empresa, negocio, industria, fábrica, comercial.
 - ruc: 11 dígitos consecutivos.
 - nombre: si dice "soy X", "me llamo X", "mi nombre es X", devuelve solo el nombre.
@@ -811,6 +876,7 @@ function fieldQuestion(field) {
 
 function nextLinearStep(currentStep) {
   let key = currentStep;
+  if (key === "material_base") key = "material";
   if (key === "ubicacion_confirmar") key = "ubicacion_pedir";
   if (key === "identificacion_nombre") key = "identificacion_ruc";
   const idx = LINEAR_STEPS.indexOf(key);
@@ -921,10 +987,13 @@ function extractInbound(body) {
   return out;
 }
 
-async function forwardLead(text) {
+async function forwardLead(text, customerFrom) {
   const dest = (process.env.LEAD_FORWARD_TO || "").replace(/\D/g, "");
   if (!dest) return;
-  await sendText(dest, `[Nuevo lead Gladis]\n\n${text}`);
+  const header = customerFrom
+    ? `📋 Nuevo lead capturado por Gladis\nCliente: ${formatPhone(customerFrom)}\n`
+    : "📋 Nuevo lead capturado por Gladis\n";
+  await sendText(dest, `${header}\n${text}`);
 }
 
 // ============================================================================
@@ -934,6 +1003,7 @@ async function forwardLead(text) {
 function currentAskableStep(session) {
   const s = session.step;
   if (s === "saludo") return "tipo_trabajo";
+  if (s === "material_base") return "material";
   if (s === "ubicacion_confirmar") return "ubicacion_pedir";
   if (s === "identificacion_nombre") return "identificacion_ruc";
   return s;
@@ -1085,6 +1155,8 @@ async function handleMessage(session, msg) {
       return await stepTipoTrabajo(session, from, userText, cls);
     case "material":
       return await stepMaterial(session, from, userText, cls);
+    case "material_base":
+      return await stepMaterialBase(session, from, userText, cls);
     case "medidas":
       return await stepMedidas(session, from, userText, cls);
     case "ambito":
@@ -1158,19 +1230,53 @@ async function stepMaterial(session, from, userText, cls) {
     );
     return;
   }
+  // Si el usuario dijo "metal/metálico" sin precisar el material base, repreguntar.
+  if (materialNeedsBaseClarification(candidate)) {
+    session.pendingMaterialBaseFrom = candidate;
+    session.step = "material_base";
+    await sendText(
+      from,
+      'Cuando dices "metal", ¿a qué te refieres específicamente: acero, fierro o aluminio? (puedes indicar el que prefieras)'
+    );
+    return;
+  }
   session.fields.material = candidate;
   session.pendingMaterialSuggestion = null;
+  await advanceAndAsk(session, from);
+}
+
+async function stepMaterialBase(session, from, userText, cls) {
+  if (cls.intent === "abuse") return await handleAbuse(session, from);
+  if (cls.intent === "off_topic") return await sendText(from, gentleRedirect("material"));
+  const text = (userText || "").trim();
+  const baseMatch = text.match(MATERIAL_SPECIFICS_RE);
+  if (!baseMatch) {
+    await sendText(
+      from,
+      "Por favor indícame el material base: acero, fierro o aluminio (puedes agregar 'inoxidable' o 'galvanizado' si aplica)."
+    );
+    return;
+  }
+  const base = baseMatch[1] || baseMatch[0];
+  const original = session.pendingMaterialBaseFrom || "";
+  const rest = stripGenericMetalPrefix(original);
+  const combined = rest ? `${base} con ${rest}` : base;
+  session.fields.material = combined;
+  session.pendingMaterialBaseFrom = null;
+  session.pendingMaterialSuggestion = null;
+  session.step = "material";
   await advanceAndAsk(session, from);
 }
 
 async function stepMedidas(session, from, userText, cls) {
   if (cls.intent === "off_topic") return await sendText(from, gentleRedirect("medidas"));
   if (cls.intent === "out_of_order") return await sendText(from, outOfOrderRedirect("medidas"));
-  const candidate = (cls.value_for_current_step || cls.captured_for_other_steps?.medidas || userText || "").trim();
+  let candidate = (cls.value_for_current_step || cls.captured_for_other_steps?.medidas || userText || "").trim();
   if (!candidate || candidate.length < 2 || isPushback(candidate)) {
     await sendText(from, askForStep(session, "medidas"));
     return;
   }
+  candidate = ensureQuantityInMedidas(userText, candidate);
   session.fields.medidas = candidate;
   if (cls.intent === "approximate_size") {
     await sendText(from, `Anotado, trabajaremos con esas medidas aproximadas para la cotización (${candidate}).`);
@@ -1304,7 +1410,7 @@ async function stepResumenConfirmar(session, from, userText, cls) {
   ) {
     await sendText(from, farewellMessage());
     try {
-      await forwardLead(summaryText(session, from));
+      await forwardLead(summaryText(session, from), from);
     } catch (e) {
       console.error("forwardLead error:", e);
     }
