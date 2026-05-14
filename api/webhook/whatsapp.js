@@ -660,7 +660,9 @@ function hasEnoughInfoForSpecConfirmation(waId) {
 
 function decorateReply(reply, { isFirst, shouldClose }) {
   const clean = normalizeAssistantReply(reply);
-  if (isFirst || shouldClose) return `${clean} ­ƒÖé`.slice(0, WHATSAPP_TEXT_MAX);
+  /** Emoji UTF-8 explícito (evita mojibake si el archivo no está en UTF-8). 🙂 = U+1F642 */
+  const closingEmoji = "\u{1F642}";
+  if (isFirst || shouldClose) return `${clean} ${closingEmoji}`.slice(0, WHATSAPP_TEXT_MAX);
   return clean;
 }
 
@@ -1016,7 +1018,7 @@ async function sendTextReply(to, text) {
     method: "POST",
     headers: {
       Authorization: `Bearer ${access}`,
-      "Content-Type": "application/json",
+      "Content-Type": "application/json; charset=utf-8",
     },
     body: JSON.stringify(payload),
   });
