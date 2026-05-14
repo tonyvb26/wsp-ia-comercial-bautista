@@ -47,7 +47,11 @@ module.exports = async function handler(req, res) {
   const verifyToken = String(process.env.WHATSAPP_VERIFY_TOKEN || "").trim();
   const accessToken = String(process.env.WHATSAPP_ACCESS_TOKEN || "").trim();
   const phoneNumberId = String(process.env.WHATSAPP_PHONE_NUMBER_ID || "").trim();
-  const providedToken = String(req.query.token || req.headers["x-admin-token"] || "").trim();
+  const bearer =
+    typeof req.headers.authorization === "string" && req.headers.authorization.startsWith("Bearer ")
+      ? req.headers.authorization.slice(7).trim()
+      : "";
+  const providedToken = String(req.query.token || bearer || req.headers["x-admin-token"] || "").trim();
   /** Opcional: si GET al número falla con token temporal, pasa el WABA ID de la pantalla de Meta. */
   const wabaIdOverride = String(req.query.waba_id || "").replace(/\D/g, "");
 
